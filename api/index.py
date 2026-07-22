@@ -140,20 +140,63 @@ class handler(BaseHTTPRequestHandler):
         created = int(time.time())
         req_model = body.get("model") or model
 
+        # Handle response_format (JSON mode)
+        response_format = body.get("response_format")
+        force_json = False
+        json_schema = None
+        if response_format:
+            if response_format.get("type") == "json_object":
+                force_json = True
+            elif response_format.get("type") == "json_schema":
+                force_json = True
+                json_schema = response_format.get("json_schema", {}).get("schema")
+
+        # Handle tools (basic support - acknowledge but don't force)
+        tools = body.get("tools")
+        tool_choice = body.get("tool_choice")
+        
         # Stateless multi-turn
         chat_id = body.get("chat_id") or None
         parent_id = body.get("parent_id") or None
 
+        # Build system prompt
+        system_parts = []
+        
+        # Extract existing system messages
+        user_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_parts.append(msg.get("content", ""))
+            else:
+                user_messages.append(msg)
+        
+        # Add JSON mode instruction if requested
+        if force_json:
+            if json_schema:
+                system_parts.append(f"You must respond with valid JSON matching this schema: {json.dumps(json_schema)}")
+            else:
+                system_parts.append("You must respond with valid JSON only. Do not include any text outside the JSON object.")
+        
+        # Add plain text instruction (unless JSON mode)
+        if not force_json:
+            system_parts.append("Respond naturally in plain text. Do not use special formatting tags or internal syntax markers.")
+        
+        # Rebuild messages with combined system prompt
+        if system_parts:
+            messages = [{"role": "system", "content": "\n\n".join(system_parts)}] + user_messages
+        else:
+            messages = user_messages
+
         content = collapse_messages(
             messages,
-            tool_mode=False,
+            tool_mode=bool(tools),
             include_history=(not chat_id and len(messages) > 1),
         )
         if not content.strip():
             return self._error(400, "messages array produced empty content")
 
         if want_stream:
-            return self._stream_chat(model, content, cid, created, req_model, chat_id, parent_id, cfg)
+            return self._stream_chat(model, content, cid, created, req_model, chat_id, parent_id, cfg, force_json)
 
         # Non-streaming
         try:
@@ -178,20 +221,53 @@ class handler(BaseHTTPRequestHandler):
 
             out = run_with_failover(work)
             next_parent = out.get("response_id")
+            
+            # Build proper OpenAI response
+            content_text = out.get("content", "")
+            
+            # Extra cleanup: strip any remaining tool syntax
+            import re
+            content_text = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', content_text, flags=re.DOTALL)
+            content_text = re.sub(r'<\|tool_call\|>.*?<\|tool_call_end\|>', '', content_text, flags=re.DOTALL)
+            content_text = re.sub(r'<\|[^|]+\|>', '', content_text)
+            content_text = content_text.strip()
+            
+            finish_reason = "stop"
+            
+            # Check if content is empty (refusal case)
+            if not content_text.strip():
+                finish_reason = "length"
+            
             message = {
                 "role": "assistant",
-                "content": out.get("content"),
+                "content": content_text,
             }
+            
+            # Add reasoning if present
             if out.get("reasoning"):
                 message["reasoning_content"] = out.get("reasoning")
             
+            # Build response matching OpenAI spec
             resp_obj = {
-                "id": cid, "object": "chat.completion", "created": created,
+                "id": cid,
+                "object": "chat.completion",
+                "created": created,
                 "model": req_model,
-                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-                "chat_id": out.get("chat_id") or chat_id,
-                "parent_id": next_parent,
+                "choices": [{
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish_reason,
+                    "logprobs": None
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0
+                },
+                "system_fingerprint": None
             }
+            
+            # Add usage if available
             if out.get("usage"):
                 u = out["usage"]
                 resp_obj["usage"] = {
@@ -199,6 +275,11 @@ class handler(BaseHTTPRequestHandler):
                     "completion_tokens": u.get("output_tokens", 0),
                     "total_tokens": u.get("total_tokens", 0),
                 }
+            
+            # Add multi-turn IDs (custom extension)
+            resp_obj["chat_id"] = out.get("chat_id") or chat_id
+            resp_obj["parent_id"] = next_parent
+            
             self._json(200, resp_obj)
         except UpstreamError as e:
             status = 400 if e.kind == "bad_request" else 401 if e.kind == "no_tokens" else 502
@@ -207,7 +288,7 @@ class handler(BaseHTTPRequestHandler):
             self._error(502, str(e))
 
     # ─── OpenAI streaming ───
-    def _stream_chat(self, model, content, cid, created, req_model, chat_id, parent_id, cfg):
+    def _stream_chat(self, model, content, cid, created, req_model, chat_id, parent_id, cfg, force_json=False):
         try:
             def work(tok):
                 nonlocal chat_id, parent_id
@@ -231,7 +312,13 @@ class handler(BaseHTTPRequestHandler):
                 send({
                     "id": cid, "object": "chat.completion.chunk",
                     "created": created, "model": req_model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    "choices": [{
+                        "index": 0, 
+                        "delta": {"role": "assistant", "content": ""}, 
+                        "finish_reason": None,
+                        "logprobs": None
+                    }],
+                    "system_fingerprint": None
                 })
 
                 state = {
@@ -246,14 +333,26 @@ class handler(BaseHTTPRequestHandler):
                         send({
                             "id": cid, "object": "chat.completion.chunk",
                             "created": created, "model": req_model,
-                            "choices": [{"index": 0, "delta": {"reasoning_content": state["reasoningDelta"]}, "finish_reason": None}],
+                            "choices": [{
+                                "index": 0, 
+                                "delta": {"reasoning_content": state["reasoningDelta"]}, 
+                                "finish_reason": None,
+                                "logprobs": None
+                            }],
+                            "system_fingerprint": None
                         })
                         state["reasoningDelta"] = ""
                     if state["contentDelta"]:
                         send({
                             "id": cid, "object": "chat.completion.chunk",
                             "created": created, "model": req_model,
-                            "choices": [{"index": 0, "delta": {"content": state["contentDelta"]}, "finish_reason": None}],
+                            "choices": [{
+                                "index": 0, 
+                                "delta": {"content": state["contentDelta"]}, 
+                                "finish_reason": None,
+                                "logprobs": None
+                            }],
+                            "system_fingerprint": None
                         })
                         state["contentDelta"] = ""
 
@@ -263,7 +362,13 @@ class handler(BaseHTTPRequestHandler):
                 final = {
                     "id": cid, "object": "chat.completion.chunk",
                     "created": created, "model": req_model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "choices": [{
+                        "index": 0, 
+                        "delta": {}, 
+                        "finish_reason": "stop",
+                        "logprobs": None
+                    }],
+                    "system_fingerprint": None,
                     "chat_id": state.get("chat_id") or chat_id,
                     "parent_id": next_parent,
                 }
@@ -355,11 +460,20 @@ class handler(BaseHTTPRequestHandler):
             out = run_with_failover(work)
             
             # Build Anthropic response
+            content_text = out.get("content", "")
+            
+            # Extra cleanup: strip any remaining tool syntax
+            import re
+            content_text = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', content_text, flags=re.DOTALL)
+            content_text = re.sub(r'<\|tool_call\|>.*?<\|tool_call_end\|>', '', content_text, flags=re.DOTALL)
+            content_text = re.sub(r'<\|[^|]+\|>', '', content_text)
+            content_text = content_text.strip()
+            
             resp_obj = {
                 "id": msg_id,
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "text", "text": out.get("content", "")}],
+                "content": [{"type": "text", "text": content_text}],
                 "model": body.get("model") or model,
                 "stop_reason": "end_turn",
             }
