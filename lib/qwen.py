@@ -28,6 +28,24 @@ class UpstreamError(Exception):
 
 def load_tokens() -> list[dict[str, Any]]:
     raw = os.environ.get("QWEN_TOKENS", "")
+    raw = raw.replace("\\n", "\n")  # .env files store literal \n
+    out: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        i = line.find("|")
+        if i < 0:
+            name, cookie = f"token{len(out) + 1}", line
+        else:
+            name, cookie = line[:i].strip(), line[i + 1:].strip()
+        if not cookie:
+            continue
+        out.append({"name": name, "cookie": cookie})
+    return out
+
+def load_tokens() -> list[dict[str, Any]]:
+    raw = os.environ.get("QWEN_TOKENS", "")
     out: list[dict[str, Any]] = []
     for line in raw.splitlines():
         line = line.strip()
