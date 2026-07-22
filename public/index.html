@@ -609,6 +609,7 @@ async function send() {
       headers: headers,
       cache: 'no-store',
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(55000),
     });
 
     if (!r.ok) {
