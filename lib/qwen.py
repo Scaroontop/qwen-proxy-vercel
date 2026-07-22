@@ -29,6 +29,9 @@ class UpstreamError(Exception):
 def load_tokens() -> list[dict[str, Any]]:
     raw = os.environ.get("QWEN_TOKENS", "")
     raw = raw.replace("\\n", "\n")  # .env files store literal \n
+    # Also split on commas as fallback for single-line env vars
+    if "\n" not in raw and "," in raw:
+        raw = "\n".join(t.strip() for t in raw.split(","))
     out: list[dict[str, Any]] = []
     for line in raw.splitlines():
         line = line.strip()
