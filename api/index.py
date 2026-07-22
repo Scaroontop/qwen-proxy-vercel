@@ -179,7 +179,7 @@ class handler(BaseHTTPRequestHandler):
         
         # Add plain text instruction (unless JSON mode)
         if not force_json:
-            system_parts.append("Respond naturally in plain text. Do not use special formatting tags or internal syntax markers.")
+            system_parts.append("You are a helpful AI assistant. Respond in English using plain text only. Do not use any special formatting, tool syntax, XML tags, or internal markers in your response.")
         
         # Rebuild messages with combined system prompt
         if system_parts:
@@ -189,7 +189,7 @@ class handler(BaseHTTPRequestHandler):
 
         content = collapse_messages(
             messages,
-            tool_mode=bool(tools),
+            tool_mode=False,  # Force tool_mode off
             include_history=(not chat_id and len(messages) > 1),
         )
         if not content.strip():
