@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen Proxy</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #262b36;
+    --text: #e6e9ef; --dim: #8b93a3; --accent: #615ced; --user: #1f3a5f;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { font-size: 16px; font-weight: 600; }
+  header .spacer { flex: 1; }
+  select, button, input, textarea { font: inherit; color: var(--text); background: #10131a; border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; }
+  button { cursor: pointer; background: var(--accent); border-color: transparent; font-weight: 600; }
+  button.ghost { background: transparent; border-color: var(--border); color: var(--dim); }
+  button:disabled { opacity: .5; cursor: default; }
+  #chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 780px; padding: 12px 16px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user); }
+  .msg.bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
+  .msg .reasoning { color: var(--dim); font-size: 13px; border-left: 3px solid var(--border); padding-left: 10px; margin-bottom: 8px; white-space: pre-wrap; }
+  .msg.err { align-self: flex-start; background: #3a1d22; border: 1px solid #6b2a35; color: #f0a8b3; }
+  #composer { display: flex; gap: 10px; padding: 14px 16px; border-top: 1px solid var(--border); background: var(--panel); }
+  #input { flex: 1; resize: none; max-height: 160px; }
+  #overlay { position: fixed; inset: 0; background: rgba(8,9,12,.9); display: none; align-items: center; justify-content: center; z-index: 10; }
+  #overlay.show { display: flex; }
+  #setup { width: min(560px, 92vw); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 26px; }
+  #setup h2 { margin-bottom: 6px; }
+  #setup p.hint { color: var(--dim); font-size: 13px; margin-bottom: 16px; }
+  #setup label { display: block; font-size: 13px; color: var(--dim); margin: 12px 0 4px; }
+  #setup input, #setup textarea { width: 100%; }
+  #setup textarea { resize: vertical; min-height: 90px; font-family: ui-monospace, monospace; font-size: 12px; }
+  #setup .row { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+  #setup .err-text { color: #f0a8b3; font-size: 13px; margin-top: 10px; min-height: 18px; }
+  #tokens { font-size: 13px; color: var(--dim); }
+  #tokens .dead { color: #f0a8b3; }
+  #tokenMgr { display: none; position: fixed; inset: 0; background: rgba(8,9,12,.9); z-index: 10; align-items: center; justify-content: center; }
+  #tokenMgr.show { display: flex; }
+  #tokenMgr .box { width: min(480px, 92vw); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 22px; }
+  #tokenMgr ul { list-style: none; margin: 14px 0; }
+  #tokenMgr li { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+  #tokenMgr li span { flex: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Qwen Proxy</h1>
+  <span id="tokens"></span>
+  <div class="spacer"></div>
+  <select id="model"></select>
+  <button class="ghost" id="manageBtn">Tokens</button>
+</header>
+
+<div id="chat"></div>
+
+<div id="composer">
+  <textarea id="input" rows="1" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="sendBtn">Send</button>
+</div>
+
+<div id="overlay" class="show">
+  <div id="setup">
+    <h2>Set a token to start</h2>
+    <p class="hint">The proxy needs at least one chat.qwen.ai cookie. Get it: F12 → Network → click any <code>/api/v2</code> request → Headers → Request Headers → <code>cookie:</code> (copy the whole value, one long line).</p>
+    <label for="tname">Token name</label>
+    <input id="tname" placeholder="acc1">
+    <label for="tcookie">Full cookie</label>
+    <textarea id="tcookie" placeholder="session=…; other=…" spellcheck="false"></textarea>
+    <div class="err-text" id="setupErr"></div>
+    <div class="row">
+      <button id="saveTokenBtn">Save token</button>
+    </div>
+  </div>
+</div>
+
+<div id="tokenMgr">
+  <div class="box">
+    <h2>Token pool</h2>
+    <ul id="tokenList"></ul>
+    <div class="row" style="display:flex;justify-content:flex-end;gap:10px">
+      <button class="ghost" id="addMoreBtn">Add token</button>
+      <button id="closeMgrBtn">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const chatEl = $('chat'), inputEl = $('input'), sendBtn = $('sendBtn');
+const overlay = $('overlay'), tokenMgr = $('tokenMgr');
+const history = [];
+let busy = false;
+// stable id so the proxy can reuse qwen chat_id + parent_id across turns
+let conversationId = (crypto.randomUUID && crypto.randomUUID()) ||
+  ('c-' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+
+async function refreshTokens() {
+  const r = await fetch('/api/tokens');
+  const j = await r.json();
+  const alive = j.tokens.filter(t => !t.dead);
+  $('tokens').innerHTML = j.tokens.length
+    ? j.tokens.map(t => `<span class="${t.dead ? 'dead' : ''}">${esc(t.name)}${t.dead ? ' (dead)' : ''}</span>`).join(' · ')
+    : 'no tokens';
+  if (!alive.length) {
+    overlay.classList.add('show');
+  } else if (!overlay.dataset.forced) {
+    overlay.classList.remove('show');
+  }
+  $('tokenList').innerHTML = j.tokens.length
+    ? j.tokens.map(t => `<li><span class="${t.dead ? 'dead' : ''}">${esc(t.name)}${t.dead ? ' — dead' : ''}</span><button class="ghost" onclick="delToken('${encodeURIComponent(t.name)}')">delete</button></li>`).join('')
+    : '<li><span>pool is empty</span></li>';
+}
+
+async function delToken(name) {
+  await fetch('/api/tokens/' + name, { method: 'DELETE' });
+  refreshTokens();
+}
+
+async function saveToken() {
+  const name = $('tname').value.trim(), cookie = $('tcookie').value.trim();
+  $('setupErr').textContent = '';
+  if (!name || !cookie) { $('setupErr').textContent = 'Both fields are required.'; return; }
+  const r = await fetch('/api/tokens', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, cookie }),
+  });
+  const j = await r.json();
+  if (!j.ok) { $('setupErr').textContent = j.error || 'Failed to save.'; return; }
+  $('tcookie').value = '';
+  overlay.dataset.forced = '';
+  overlay.classList.remove('show');
+  refreshTokens();
+  inputEl.focus();
+}
+
+async function loadModels() {
+  try {
+    const r = await fetch('/v1/models');
+    const j = await r.json();
+    $('model').innerHTML = j.data.map(m => `<option>${esc(m.id)}</option>`).join('');
+  } catch {}
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function addMsg(role, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + role;
+  d.textContent = text;
+  chatEl.appendChild(d);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return d;
+}
+
+async function send() {
+  const text = inputEl.value.trim();
+  if (!text || busy) return;
+  busy = true; sendBtn.disabled = true;
+  inputEl.value = '';
+  addMsg('user', text);
+
+  // snapshot for request; only commit history after a real reply
+  const outgoing = history.concat([{ role: 'user', content: text }]);
+
+  const bot = addMsg('bot', '');
+  const reasonEl = document.createElement('div');
+  reasonEl.className = 'reasoning';
+  reasonEl.style.display = 'none';
+  bot.appendChild(reasonEl);
+  const contentEl = document.createElement('span');
+  bot.appendChild(contentEl);
+
+  let answer = '';
+  let gotDone = false;
+  try {
+    const r = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // cache: 'no-store' forces a clean request after Connection: close SSE
+      cache: 'no-store',
+      body: JSON.stringify({
+        model: $('model').value,
+        stream: true,
+        conversation_id: conversationId,
+        messages: outgoing,
+      }),
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error((j.error && j.error.message) || ('HTTP ' + r.status));
+    }
+    if (!r.body) throw new Error('empty response body');
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        for (const line of block.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          if (payload === '[DONE]') { gotDone = true; continue; }
+          try {
+            const j = JSON.parse(payload);
+            const delta = j.choices && j.choices[0] && j.choices[0].delta;
+            if (!delta) continue;
+            if (delta.reasoning_content) {
+              reasonEl.style.display = '';
+              reasonEl.textContent += delta.reasoning_content;
+            }
+            if (delta.content) {
+              answer += delta.content;
+              contentEl.textContent = answer;
+            }
+          } catch {}
+        }
+        chatEl.scrollTop = chatEl.scrollHeight;
+      }
+    }
+    // flush trailing buffer without trailing \n\n
+    if (buf.trim()) {
+      for (const line of buf.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') { gotDone = true; continue; }
+        try {
+          const j = JSON.parse(payload);
+          const delta = j.choices && j.choices[0] && j.choices[0].delta;
+          if (delta && delta.content) {
+            answer += delta.content;
+            contentEl.textContent = answer;
+          }
+        } catch {}
+      }
+    }
+    if (answer.trim()) {
+      history.push({ role: 'user', content: text });
+      history.push({ role: 'assistant', content: answer });
+    } else if (!reasonEl.textContent) {
+      contentEl.textContent = gotDone ? '(empty reply)' : '(stream cut off)';
+    }
+  } catch (e) {
+    bot.className = 'msg err';
+    bot.textContent = 'Error: ' + (e && e.message ? e.message : e);
+  } finally {
+    busy = false; sendBtn.disabled = false;
+    chatEl.scrollTop = chatEl.scrollHeight;
+    inputEl.focus();
+  }
+}
+
+sendBtn.onclick = send;
+inputEl.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
+$('saveTokenBtn').onclick = saveToken;
+$('manageBtn').onclick = () => { tokenMgr.classList.add('show'); refreshTokens(); };
+$('closeMgrBtn').onclick = () => tokenMgr.classList.remove('show');
+$('addMoreBtn').onclick = () => { tokenMgr.classList.remove('show'); overlay.dataset.forced = '1'; overlay.classList.add('show'); };
+
+refreshTokens();
+loadModels();
+setInterval(refreshTokens, 15000);
+</script>
+</body>
+</html>
