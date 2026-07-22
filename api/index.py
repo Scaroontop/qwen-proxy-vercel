@@ -225,6 +225,10 @@ class handler(BaseHTTPRequestHandler):
             # Build proper OpenAI response
             content_text = out.get("content", "")
             
+            # If no content came through, fall back to reasoning as the answer
+            if not content_text.strip() and out.get("reasoning"):
+                content_text = out.get("reasoning", "")
+            
             # Extra cleanup: strip any remaining tool syntax
             import re
             content_text = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', content_text, flags=re.DOTALL)
@@ -358,6 +362,21 @@ class handler(BaseHTTPRequestHandler):
 
                 consume_sse(resp, on_event)
 
+                # If no answer content came through, fall back to reasoning
+                if not state["content"].strip() and state["reasoning"].strip():
+                    send({
+                        "id": cid, "object": "chat.completion.chunk",
+                        "created": created, "model": req_model,
+                        "choices": [{
+                            "index": 0, 
+                            "delta": {"content": state["reasoning"]}, 
+                            "finish_reason": None,
+                            "logprobs": None
+                        }],
+                        "system_fingerprint": None
+                    })
+                    state["content"] = state["reasoning"]
+
                 next_parent = state.get("response_id")
                 final = {
                     "id": cid, "object": "chat.completion.chunk",
@@ -462,6 +481,10 @@ class handler(BaseHTTPRequestHandler):
             # Build Anthropic response
             content_text = out.get("content", "")
             
+            # If no content came through, fall back to reasoning
+            if not content_text.strip() and out.get("reasoning"):
+                content_text = out.get("reasoning", "")
+            
             # Extra cleanup: strip any remaining tool syntax
             import re
             content_text = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', content_text, flags=re.DOTALL)
@@ -550,6 +573,15 @@ class handler(BaseHTTPRequestHandler):
                         state["contentDelta"] = ""
 
                 consume_sse(resp, on_event)
+
+                # If no answer content came through, fall back to reasoning
+                if not state["content"].strip() and state["reasoning"].strip():
+                    send_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": state["reasoning"]}
+                    })
+                    state["content"] = state["reasoning"]
 
                 # content_block_stop
                 send_event("content_block_stop", {
