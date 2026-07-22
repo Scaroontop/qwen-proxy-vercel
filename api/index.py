@@ -243,17 +243,6 @@ def track_ids(frame, state):
     if rid:
         state["response_id"] = rid
 
-
-def extract_delta(frame, state):
-    track_ids(frame, state)
-Alright can you continue?
-(empty reply)
-Continue
-Resume the sequence where the previous execution left off
-I am reconstructing the narrative thread from the last discernible point of continuity  
-Continuing with precision to restore the full context without interruption  
-Completing the transformation with seamless coherence
-```python
 def extract_delta(frame, state):
     track_ids(frame, state)
     d = ((frame.get("choices") or [{}])[0] or {}).get("delta")
