@@ -153,12 +153,12 @@ def completion_body(chat_id: str, model: str, content: str, *, parent_id: str | 
             "model": "",
             "chat_type": "t2t",
             "feature_config": {
-                "thinking_enabled": True,
-                "output_schema": "phase",
+                "thinking_enabled": False,
+                "output_schema": "text",
                 "research_mode": "normal",
                 "auto_thinking": False,
-                "thinking_mode": "Thinking",
-                "thinking_format": "summary",
+                "thinking_mode": "None",
+                "thinking_format": "none",
                 "auto_search": auto_search,
                 "tool_enabled": False,
                 "plugin_enabled": False,
@@ -294,34 +294,28 @@ def extract_delta(frame: dict, state: dict) -> None:
     if d.get("phase") == "answer":
         if d.get("content"):
             content = d["content"]
-            # Aggressive cleanup of all qwen markers
-            content = re.sub(r'<\|im_start\|>[^<]*<\|im_end\|>', '', content, flags=re.DOTALL)
-            content = re.sub(r'<\|tool_call\|>[^<]*<\|tool_call_end\|>', '', content, flags=re.DOTALL)
+            # Strip qwen's internal markers but preserve actual content
+            content = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', content, flags=re.DOTALL)
+            content = re.sub(r'<\|tool_call\|>.*?<\|tool_call_end\|>', '', content, flags=re.DOTALL)
             content = re.sub(r'<\|im_start\|>', '', content)
             content = re.sub(r'<\|im_end\|>', '', content)
             content = re.sub(r'<\|tool_call\|>', '', content)
             content = re.sub(r'<\|tool_call_end\|>', '', content)
-            content = re.sub(r'<\|[a-z_]+\|>', '', content)
-            content = re.sub(r'<arg_key>[^<]*</arg_key>', '', content)
-            content = re.sub(r'<arg_value>[^<]*</arg_value>', '', content)
-            content = re.sub(r'<\|name>[^<]*</\|name>', '', content)
+            content = re.sub(r'<\|name\>.*?</name\|>', '', content)
             state["contentDelta"] = content
         if d.get("status") == "finished":
             state["finished"] = True
         return
     if d.get("content") and not d.get("phase"):
         content = d["content"]
-        # Aggressive cleanup of all qwen markers
-        content = re.sub(r'<\|im_start\|>[^<]*<\|im_end\|>', '', content, flags=re.DOTALL)
-        content = re.sub(r'<\|tool_call\|>[^<]*<\|tool_call_end\|>', '', content, flags=re.DOTALL)
+        # Strip qwen's internal markers but preserve actual content
+        content = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', content, flags=re.DOTALL)
+        content = re.sub(r'<\|tool_call\|>.*?<\|tool_call_end\|>', '', content, flags=re.DOTALL)
         content = re.sub(r'<\|im_start\|>', '', content)
         content = re.sub(r'<\|im_end\|>', '', content)
         content = re.sub(r'<\|tool_call\|>', '', content)
         content = re.sub(r'<\|tool_call_end\|>', '', content)
-        content = re.sub(r'<\|[a-z_]+\|>', '', content)
-        content = re.sub(r'<arg_key>[^<]*</arg_key>', '', content)
-        content = re.sub(r'<arg_value>[^<]*</arg_value>', '', content)
-        content = re.sub(r'<\|name>[^<]*</\|name>', '', content)
+        content = re.sub(r'<\|name\>.*?</name\|>', '', content)
         state["contentDelta"] = content
 
 
