@@ -11,6 +11,27 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 BASE = "https://chat.qwen.ai"
+
+# Anti-bot / access-verification response detector. Qwen returns these
+# when the session needs another challenge (CAPTCHA, risk check). Matching
+# either a 401/403 status or this body lets us fail fast with a clear
+# "challenge" error instead of pretending the request succeeded.
+_CHALLENGE_RE = re.compile(
+    r"access\s+verification|verify\s+that\s+you\s+are|"
+    r"captcha|risk|please\s+complete\s+the\s+operation",
+    re.IGNORECASE,
+)
+
+
+def detect_challenge(status: int | None, body: str) -> bool:
+    """True if Qwen response signals an anti-bot challenge."""
+    if status in (401, 403):
+        return True
+    if not body:
+        return False
+    return bool(_CHALLENGE_RE.search(body))
+
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
@@ -69,6 +90,7 @@ def hdrs(tok: dict[str, Any]) -> dict[str, str]:
         "Cookie": tok["cookie"],
         "X-Accel-Buffering": "no",
         "X-Request-Id": str(uuid.uuid4()),
+        "Timezone": time.strftime("%a %b %d %Y %H:%M:%S GMT%z (%Z)"),
     }
 
 
@@ -122,6 +144,8 @@ def create_chat(tok: dict[str, Any], model: str) -> str:
     err = classify_body(text)
     if err:
         raise err
+    if detect_challenge(status, text):
+        raise UpstreamError("challenge", "qwen anti-bot challenge triggered")
     if status != 200:
         raise UpstreamError(f"http_{status}", text[:300])
     j = json.loads(text)
@@ -185,11 +209,19 @@ def open_completion_stream(tok: dict[str, Any], chat_id: str, model: str, conten
         resp = urlopen(req, timeout=300)
     except HTTPError as e:
         raw = e.read().decode("utf-8", errors="replace")
+        if detect_challenge(e.code, raw):
+            raise UpstreamError("challenge", "qwen anti-bot challenge triggered") from e
         raise UpstreamError(f"http_{e.code}", raw[:300]) from e
     except URLError as e:
         raise UpstreamError("network", str(e.reason)) from e
-    if resp.status != 200:
+    # Qwen returns 200 even for failures sometimes — the error shows up as
+    # a JSON body instead of an event-stream. Sniff the content-type and
+    # reject early so callers do not parse JSON as SSE.
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    if resp.status != 200 or "text/event-stream" not in ct:
         raw = resp.read().decode("utf-8", errors="replace")
+        if detect_challenge(resp.status, raw):
+            raise UpstreamError("challenge", "qwen anti-bot challenge triggered")
         raise UpstreamError(f"http_{resp.status}", raw[:300])
     return resp
 
@@ -707,6 +739,14 @@ def _strip_raw_toolcalls_json(text: str) -> str:
 
 def extract_delta(frame: dict, state: dict) -> None:
     track_ids(frame, state)
+    # Qwen emits in-stream error events like {"error":{"code":...,...}}.
+    # Raise so the upstream work fn sees a clean UpstreamError and
+    # run_with_failover can advance tokens (instead of silently swallowing).
+    err = frame.get("error")
+    if err:
+        detail = (err.get("details") or err.get("code")
+                  or err.get("message") or "unknown")
+        raise UpstreamError("stream_error", str(detail))
     d = ((frame.get("choices") or [{}])[0] or {}).get("delta")
     if frame.get("usage"):
         state["usage"] = frame["usage"]
