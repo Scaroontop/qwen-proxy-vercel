@@ -218,7 +218,19 @@ class handler(BaseHTTPRequestHandler):
         # ─── Build system prompt ───
         system_parts = []
 
-        # Extract existing system messages and conversation messages
+        # Extract file inputs FIRST. extract_image_inputs both pulls out the
+        # binary uploads AND inlines text-file contents (.html/.py/.txt/etc)
+        # into the message text. We must split system/user from the CLEANED
+        # result — splitting the raw input and rebuilding from it later would
+        # throw away the inlined file contents, leaving the model to
+        # hallucinate about a file it never actually saw.
+        img_inputs = []
+        try:
+            messages, img_inputs = extract_image_inputs(messages)
+        except UpstreamError as e:
+            return self._error(400, f"image input rejected: {e.detail or e.kind}")
+
+        # Split the cleaned messages into system prompt parts + conversation.
         user_messages = []
         for msg in messages:
             if msg.get("role") == "system":
@@ -228,14 +240,6 @@ class handler(BaseHTTPRequestHandler):
                 system_parts.append(content)
             else:
                 user_messages.append(msg)
-
-        # Extract file inputs up front so every path below can reference
-        # img_inputs without an UnboundLocalError (tools/non-tools alike).
-        img_inputs = []
-        try:
-            messages, img_inputs = extract_image_inputs(messages)
-        except UpstreamError as e:
-            return self._error(400, f"image input rejected: {e.detail or e.kind}")
 
         # When the user attached files (ZCode @file, OpenAI image_url/input_file,
         # Anthropic image/document blocks), qwen receives them in the
@@ -552,7 +556,15 @@ class handler(BaseHTTPRequestHandler):
                         })
                         state["contentDelta"] = ""
 
-                consume_sse(resp, on_event)
+                try:
+                    consume_sse(resp, on_event)
+                except UpstreamError:
+                    # Headers were already sent when the stream opened, so we
+                    # cannot fail over to another token without corrupting the
+                    # committed HTTP response (re-sending status + headers).
+                    # Finalize with whatever content we buffered instead of
+                    # letting run_with_failover retry and garble the stream.
+                    pass
                 flush_answer_buffer(state)
 
                 # If no answer content came through, fall back to reasoning
@@ -863,7 +875,15 @@ class handler(BaseHTTPRequestHandler):
                         output_tokens += len(state["contentDelta"]) // 4  # rough estimate
                         state["contentDelta"] = ""
 
-                consume_sse(resp, on_event)
+                try:
+                    consume_sse(resp, on_event)
+                except UpstreamError:
+                    # Headers were already sent when the stream opened, so we
+                    # cannot fail over to another token without corrupting the
+                    # committed HTTP response (re-sending status + headers).
+                    # Finalize with whatever content we buffered instead of
+                    # letting run_with_failover retry and garble the stream.
+                    pass
                 flush_answer_buffer(state)
 
                 # If no answer content came through, fall back to reasoning
