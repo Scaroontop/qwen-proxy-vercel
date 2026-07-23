@@ -19,6 +19,7 @@ from lib.qwen import (
     strip_thinking_narration, _strip_raw_toolcalls_json as strip_raw_toolcalls,
     maybe_inject_project_file,
     extract_image_inputs, upload_image_to_oss,
+    _flush_answer_buffer as flush_answer_buffer,
 )
 
 # API key - can be overridden via env
@@ -354,6 +355,7 @@ class handler(BaseHTTPRequestHandler):
                         state["content"] += state["contentDelta"]
                         state["contentDelta"] = ""
                 consume_sse(resp, on_event)
+                flush_answer_buffer(state)
                 return state
 
             out = run_with_failover(work)
@@ -551,6 +553,7 @@ class handler(BaseHTTPRequestHandler):
                         state["contentDelta"] = ""
 
                 consume_sse(resp, on_event)
+                flush_answer_buffer(state)
 
                 # If no answer content came through, fall back to reasoning
                 if not state["content"].strip() and state["reasoning"].strip():
@@ -757,6 +760,7 @@ class handler(BaseHTTPRequestHandler):
                         state["content"] += state["contentDelta"]
                         state["contentDelta"] = ""
                 consume_sse(resp, on_event)
+                flush_answer_buffer(state)
                 return state
 
             out = run_with_failover(work)
@@ -860,6 +864,7 @@ class handler(BaseHTTPRequestHandler):
                         state["contentDelta"] = ""
 
                 consume_sse(resp, on_event)
+                flush_answer_buffer(state)
 
                 # If no answer content came through, fall back to reasoning
                 if not state["content"].strip() and state["reasoning"].strip():
