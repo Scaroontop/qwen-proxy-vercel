@@ -49,6 +49,28 @@ def _upload_files(tok, img_inputs):
     return out
 
 
+_ATTACH_NOTE = (
+    " The user attached one or more files to this message; they have been "
+    "uploaded and are available to you as real input. Answer questions "
+    "about their contents directly. Do NOT say you cannot view or access "
+    "files. Do NOT ask the user to paste the contents. Do NOT narrate "
+    "reading them. Just use the contents and answer."
+)
+
+
+def _attach_files_note(messages, img_inputs):
+    """When the request included uploaded files, splice an anti-refusal
+    note into the system message (or prepend one) so qwen treats the
+    uploaded contents as authoritative instead of refusing."""
+    if not img_inputs:
+        return
+    if messages and messages[0].get("role") == "system":
+        base = flatten_content(messages[0].get("content")) or ""
+        messages[0]["content"] = base + _ATTACH_NOTE
+    else:
+        messages.insert(0, {"role": "system", "content": _ATTACH_NOTE.strip()})
+
+
 class handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -213,6 +235,21 @@ class handler(BaseHTTPRequestHandler):
             messages, img_inputs = extract_image_inputs(messages)
         except UpstreamError as e:
             return self._error(400, f"image input rejected: {e.detail or e.kind}")
+
+        # When the user attached files (ZCode @file, OpenAI image_url/input_file,
+        # Anthropic image/document blocks), qwen receives them in the
+        # `files` array of the completion request. Without an explicit
+        # instruction it tends to narrate "I cannot access files" — so tell
+        # it the attachments are real and to answer about them directly.
+        if img_inputs and not force_json:
+            system_parts.append(
+                " The user attached one or more files to this message; they "
+                "have been uploaded and are available to you as real input. "
+                "Answer questions about their contents directly. Do NOT say "
+                "you cannot view or access files. Do NOT ask the user to "
+                "paste the contents. Do NOT narrate reading them. Just use "
+                "the contents and answer."
+            )
 
         # Add tool instructions if tools are provided
         if tool_mode:
@@ -684,6 +721,8 @@ class handler(BaseHTTPRequestHandler):
             messages, img_inputs = extract_image_inputs(messages)
         except UpstreamError as e:
             return self._anthropic_error(400, "invalid_request_error", f"image input rejected: {e.detail or e.kind}")
+
+        _attach_files_note(messages, img_inputs)
 
         content = collapse_messages(messages, tool_mode=False, include_history=True)
         if not content.strip() and not img_inputs:
