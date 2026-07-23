@@ -17,24 +17,23 @@ from lib.qwen import (
     run_with_failover, UpstreamError, load_tokens, get_config, flatten_content,
     build_tool_instructions, try_parse_tool_calls,
     strip_thinking_narration, _strip_raw_toolcalls_json as strip_raw_toolcalls,
+    maybe_inject_project_file,
 )
 
 # API key - can be overridden via env
 API_KEY = os.environ.get("API_KEY", "nevinisgay")
 
-# Model list with metadata
+# Model list with metadata — IDs must match what qwen.ai's web chat accepts.
+# Verified working: qwen3.8-max-preview (the others below share the same family
+# of supported model ids; aliases like qwen-max / qwen-plus are NOT accepted by
+# the upstream — they're DashScope ids, not chat.qwen.ai ids).
 MODELS = [
-    {"id": "qwen-max", "name": "Qwen Max", "context": 30000},
-    {"id": "qwen-plus", "name": "Qwen Plus", "context": 30000},
-    {"id": "qwen-turbo", "name": "Qwen Turbo", "context": 8000},
-    {"id": "qwen-long", "name": "Qwen Long", "context": 1000000},
-    {"id": "qwen2.5-72b-instruct", "name": "Qwen 2.5 72B", "context": 32000},
-    {"id": "qwen2.5-32b-instruct", "name": "Qwen 2.5 32B", "context": 32000},
-    {"id": "qwen3-235b-a22b", "name": "Qwen 3 235B", "context": 32000},
+    {"id": "qwen3.8-max-preview", "name": "Qwen 3.8 Max Preview", "context": 32000},
+    {"id": "qwen3-235b-a22b", "name": "Qwen 3 235B A22B", "context": 32000},
     {"id": "qwen3-32b", "name": "Qwen 3 32B", "context": 32000},
     {"id": "qwen3-14b", "name": "Qwen 3 14B", "context": 32000},
     {"id": "qwen3-8b", "name": "Qwen 3 8B", "context": 32000},
-    {"id": "qwen3.8-max-preview", "name": "Qwen 3.8 Max Preview", "context": 32000},
+    {"id": "qwen3-next-80b-a3b", "name": "Qwen 3 Next 80B A3B", "context": 32000},
 ]
 
 
@@ -209,6 +208,36 @@ class handler(BaseHTTPRequestHandler):
                     "- Respond in English using plain text only. No special formatting, tool syntax, XML tags, or internal markers.\n"
                     "- If the user asks you to fix or edit a file/code, provide the corrected code in a code block. Do not ask the user to paste it unless it is genuinely missing from the conversation.\n"
                 )
+
+            # Read-only project file injection: if the user's last message
+            # asks to view / fix / etc a known proxy-side file, append its
+            # contents to the message so qwen can answer about it directly.
+            injected_note = ""
+            if user_messages:
+                last = user_messages[-1]
+                last_text = flatten_content(last.get("content", "")) if isinstance(last.get("content"), (str, list)) else str(last.get("content", ""))
+                if last.get("role") == "user" and last_text:
+                    injected = maybe_inject_project_file(last_text)
+                    if injected:
+                        last["content"] = (last_text + injected)
+                        if not force_json:
+                            injected_note = (
+                                " You may be shown the contents of a project "
+                                "file via a 'SYSTEM NOTE' block in the user "
+                                "message. When that happens, treat it as your "
+                                "source of truth for that file. Answer the "
+                                "user's request about it directly. Do NOT "
+                                "narrate that you are reading it; just use it."
+                            )
+
+            if injected_note and system_parts:
+                # Splice the file-context note into the existing base system
+                # prompt rather than appending a separate system message qwen
+                # may reject.
+                system_parts = [
+                    (p + injected_note) if i == len(system_parts) - 1 else p
+                    for i, p in enumerate(system_parts)
+                ]
 
             # Rebuild messages with combined system prompt
             if system_parts:
@@ -560,6 +589,28 @@ class handler(BaseHTTPRequestHandler):
         max_tokens = body.get("max_tokens", 4096)
         msg_id = "msg_" + uuid.uuid4().hex[:24]
         created = int(time.time())
+
+        # Read-only project file injection (same as OpenAI path)
+        nudged_system = None
+        if messages:
+            for i in range(len(messages) - 1, -1, -1):
+                last = messages[i]
+                if last.get("role") != "user":
+                    continue
+                last_text = flatten_content(last.get("content", "")) if isinstance(last.get("content"), (str, list)) else str(last.get("content", ""))
+                injected = maybe_inject_project_file(last_text)
+                if injected:
+                    last["content"] = (last_text + injected)
+                    nudged_system = (
+                        " You may be shown the contents of a project file via a "
+                        "'SYSTEM NOTE' block in the user message. When that "
+                        "happens, treat it as your source of truth for that "
+                        "file. Answer the user's request about it directly. Do "
+                        "NOT narrate that you are reading it; just use it."
+                    )
+                break
+        if nudged_system and messages and messages[0].get("role") == "system":
+            messages[0]["content"] = (flatten_content(messages[0].get("content", "")) or "") + nudged_system
 
         content = collapse_messages(messages, tool_mode=False, include_history=True)
         if not content.strip():
