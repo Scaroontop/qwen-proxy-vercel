@@ -132,7 +132,7 @@ def create_chat(tok: dict[str, Any], model: str) -> str:
 
 # ─── Completion stream ─────────────────────────────────────────────
 
-def completion_body(chat_id: str, model: str, content: str, *, parent_id: str | None = None, auto_search: bool = False) -> dict[str, Any]:
+def completion_body(chat_id: str, model: str, content: str, *, parent_id: str | None = None, auto_search: bool = False, files: list | None = None) -> dict[str, Any]:
     ts = int(time.time())
     return {
         "stream": True,
@@ -150,7 +150,7 @@ def completion_body(chat_id: str, model: str, content: str, *, parent_id: str | 
             "role": "user",
             "content": content,
             "user_action": "chat",
-            "files": [],
+            "files": files or [],
             "timestamp": ts,
             "models": [model],
             "model": "",
@@ -174,8 +174,8 @@ def completion_body(chat_id: str, model: str, content: str, *, parent_id: str | 
     }
 
 
-def open_completion_stream(tok: dict[str, Any], chat_id: str, model: str, content: str, *, parent_id: str | None = None, auto_search: bool = False):
-    payload = json.dumps(completion_body(chat_id, model, content, parent_id=parent_id, auto_search=auto_search)).encode()
+def open_completion_stream(tok: dict[str, Any], chat_id: str, model: str, content: str, *, parent_id: str | None = None, auto_search: bool = False, files: list | None = None):
+    payload = json.dumps(completion_body(chat_id, model, content, parent_id=parent_id, auto_search=auto_search, files=files)).encode()
     headers = hdrs(tok)
     req = Request(
         f"{BASE}/api/v2/chat/completions?chat_id={chat_id}",
@@ -192,6 +192,308 @@ def open_completion_stream(tok: dict[str, Any], chat_id: str, model: str, conten
         raw = resp.read().decode("utf-8", errors="replace")
         raise UpstreamError(f"http_{resp.status}", raw[:300])
     return resp
+
+
+# ─── Image / file upload to qwen OSS ────────────────────────────────
+# Replays the qwen.ai chat upload flow observed in network captures:
+#   1. POST /api/v2/files/getstsToken with {filename, filesize, filetype:"image"}
+#      authenticated by the user's cookie — returns STS creds + a signed OSS
+#      object URL + the bucket / region / file_id.
+#   2. PUT <file_url> with the raw image bytes, signed using OSS V4 (the URL
+#      already carries all required signature query params except
+#      x-oss-security-token which the SDK includes as a header). Empirically
+#      the URL query is sufficient for qwen's OSS bucket: just PUT the bytes
+#      with the same headers ali-oss sends and OSS accepts.
+
+import base64
+import hashlib
+import hmac
+import urllib.parse as up
+
+# Standard MIME -> qwen filetype buckets the web app uses
+_MIME_TO_FILETYPE = {
+    "image/png": "image",
+    "image/jpeg": "image",
+    "image/jpg": "image",
+    "image/webp": "image",
+    "image/gif": "image",
+    "image/bmp": "image",
+}
+
+
+_DOC_MIME_FILETYPE = {
+    "text/plain": "file",
+    "text/html": "file",
+    "text/markdown": "file",
+    "application/json": "file",
+    "text/csv": "file",
+    "application/pdf": "file",
+    "application/javascript": "file",
+    "text/javascript": "file",
+    "text/xml": "file",
+    "application/xml": "file",
+    "text/yaml": "file",
+    "application/x-yaml": "file",
+}
+
+
+_EXT_TO_MIME = {
+    "txt": "text/plain",
+    "html": "text/html", "htm": "text/html",
+    "md": "text/markdown", "markdown": "text/markdown",
+    "py": "text/plain",
+    "js": "application/javascript", "mjs": "application/javascript",
+    "ts": "text/plain", "tsx": "text/plain",
+    "json": "application/json",
+    "csv": "text/csv", "tsv": "text/csv",
+    "yaml": "text/yaml", "yml": "text/yaml",
+    "xml": "text/xml",
+    "c": "text/x-c", "cc": "text/x-c++", "cpp": "text/x-c++",
+    "h": "text/x-c", "hpp": "text/x-c++",
+    "java": "text/x-java",
+    "go": "text/x-go",
+    "rs": "text/x-rust",
+    "rb": "text/plain", "sh": "text/plain", "sql": "text/plain",
+    "css": "text/plain",
+    "pdf": "application/pdf",
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+}
+
+
+def guess_filetype(content_type, filename):
+    ct = (content_type or "").lower()
+    if ct in _MIME_TO_FILETYPE:
+        return "image"
+    if ct in _DOC_MIME_FILETYPE:
+        return "file"
+    ext = (filename.rsplit(".", 1)[-1] if "." in filename else "").lower()
+    if ext in _EXT_TO_MIME:
+        if ext in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
+            return "image"
+        return "file"
+    return "file"
+
+
+def _get_oss_token(tok: dict[str, Any], filename: str, filesize: int, filetype: str) -> dict:
+    """POST /api/v2/files/getstsToken and return the parsed data dict."""
+    headers = hdrs(tok)
+    body = json.dumps({
+        "filename": filename,
+        "filesize": str(filesize),
+        "filetype": filetype,
+    }).encode()
+    req = Request(
+        f"{BASE}/api/v2/files/getstsToken",
+        data=body, headers=headers, method="POST",
+    )
+    resp = urlopen(req, timeout=30)
+    raw = resp.read().decode("utf-8", errors="replace")
+    obj = json.loads(raw)
+    if not obj.get("success"):
+        raise UpstreamError("oss_token", raw[:300])
+    return obj["data"]
+
+
+def _oss_put(file_url: str, data: bytes, content_type: str, extra_headers: dict | None = None) -> None:
+    """PUT raw bytes to the signed OSS URL the token issued."""
+    headers = {
+        "Content-Type": content_type,
+        "Accept": "*/*",
+        "Origin": BASE,
+        "Referer": BASE + "/",
+        "User-Agent": UA,
+        "x-oss-content-type": content_type,
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    req = Request(file_url, data=data, headers=headers, method="PUT")
+    try:
+        r = urlopen(req, timeout=60)
+        if r.status != 200:
+            raise UpstreamError("oss_put", f"status={r.status}")
+    except HTTPError as e:
+        raise UpstreamError("oss_put", f"{e.code} {e.read()[:200]!r}") from e
+
+
+def upload_file_to_oss(
+    tok: dict[str, Any],
+    file_bytes: bytes,
+    filename: str,
+    content_type: str,
+) -> dict:
+    """Upload a single file (image OR document) to qwen's OSS bucket using a
+    freshly-minted STS token, and return the qwen-formatted file descriptor
+    block ready to drop into the completion request's `files` array.
+
+    Routes to qwen's `image` or `file` filetype based on the content type /
+    extension. Documents become file_class:document, showType:file. Images
+    become file_class:vision, showType:image (matching the web UI shape).
+    """
+    ft = guess_filetype(content_type, filename)
+    if not filename:
+        filename = f"upload.{ft}"
+    # Reconcile content type if we have an extension fallback
+    ct = (content_type or "").lower()
+    if ct not in _MIME_TO_FILETYPE and ct not in _DOC_MIME_FILETYPE:
+        ext = (filename.rsplit(".", 1)[-1] if "." in filename else "").lower()
+        if ext in _EXT_TO_MIME:
+            content_type = _EXT_TO_MIME[ext]
+    token = _get_oss_token(tok, filename, len(file_bytes), ft)
+    file_url = token["file_url"]
+    file_id = token["file_id"]
+    _oss_put(file_url, file_bytes, content_type)
+    is_image = (ft == "image")
+    ts_now = int(time.time() * 1000)
+    meta = {
+        "name": filename,
+        "size": len(file_bytes),
+        "content_type": content_type,
+    }
+    if not is_image:
+        meta["parse_meta"] = {"parse_status": "success"}
+    return {
+        "type": "image" if is_image else "file",
+        "file": {
+            "created_at": ts_now,
+            "data": {},
+            "filename": filename,
+            "hash": None,
+            "id": file_id,
+            "user_id": None,
+            "meta": meta,
+            "update_at": ts_now,
+            "name": filename,
+            "webkitRelativePath": "",
+            "size": len(file_bytes),
+            "type": content_type,
+        },
+        "id": file_id,
+        "url": file_url.split("?")[0],
+        "name": filename,
+        "collection_name": "",
+        "progress": 100,
+        "status": "uploaded",
+        "greenNet": "success",
+        "size": len(file_bytes),
+        "error": "",
+        "file_type": content_type,
+        "showType": "image" if is_image else "file",
+        "file_class": "vision" if is_image else "document",
+    }
+
+
+# Backward-compat alias — older code uses `upload_image_to_oss` for images
+upload_image_to_oss = upload_file_to_oss
+
+
+
+# OpenAI-format image extraction
+
+_DATA_URI_RE = re.compile(r"^data:([\w/+-]+);base64,(.*)$", re.DOTALL)
+
+
+def _fetch_url(url: str, max_bytes: int = 8 * 1024 * 1024) -> tuple[bytes, str]:
+    """Fetch a public URL and return (bytes, content-type). Rejects > 8MB."""
+    req = Request(url, headers={"User-Agent": UA}, method="GET")
+    r = urlopen(req, timeout=20)
+    ct = (r.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
+    data = r.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise UpstreamError("file_too_big", "image exceeds 8MB")
+    return data, ct
+
+
+def extract_image_inputs(messages: list[dict]) -> tuple[list[dict], list[tuple[bytes, str, str]]]:
+    """Split OpenAI multi-modal messages into (text_messages, file_inputs).
+
+    file_inputs is a list of (bytes, filename, content_type) tuples ready to
+    hand to upload_file_to_oss. text_messages is the input list with file/image
+    content removed (so collapse_messages gets pure text).
+
+    Supported attachment block shapes (inside `content` arrays):
+      - {"type":"image_url", "image_url":{"url": "<data-uri or http url>"}}
+      - {"type":"image_url", "image_url": "<data-uri or http url>"}
+      - {"type":"input_file", "filename":"foo.html", "file_data":"<data-uri>"}
+      - {"type":"file", "filename":"foo.html", "file_data":"<data-uri>"}
+      - {"type":"input_file", "filename":"foo.txt",
+         "file_data":{"data":"<base64>", "content_type":"text/plain"}}
+    """
+    img_inputs = []
+    text_messages = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if isinstance(content, str):
+            text_messages.append(msg)
+            continue
+        if not isinstance(content, list):
+            text_messages.append(msg)
+            continue
+        text_parts = []
+        had_image = False
+        for block in content:
+            if not isinstance(block, dict):
+                text_parts.append(str(block))
+                continue
+            bt = block.get("type")
+            if bt == "text":
+                text_parts.append(block.get("text", ""))
+            elif bt == "image_url":
+                url = (block.get("image_url") or {}).get("url") if isinstance(block.get("image_url"), dict) else block.get("image_url")
+                if not url:
+                    continue
+                had_image = True
+                m = _DATA_URI_RE.match(url)
+                if m:
+                    ct = m.group(1)
+                    try:
+                        data = base64.b64decode(m.group(2))
+                    except Exception as e:
+                        raise UpstreamError("bad_base64", str(e))
+                    ext = ct.split("/")[-1].split("+")[0]
+                    fn = f"image.{ext}"
+                else:
+                    try:
+                        data, ct = _fetch_url(url)
+                    except UpstreamError:
+                        raise
+                    except Exception as e:
+                        raise UpstreamError("fetch_img", str(e))
+                    fn = (url.split("/")[-1].split("?")[0]) or f"image.{ct.split('/')[-1]}"
+                img_inputs.append((data, fn, ct))
+            elif bt in ("input_file", "file"):
+                fn = block.get("filename") or block.get("name") or "upload.txt"
+                fd = block.get("file_data")
+                if isinstance(fd, dict):
+                    b64 = fd.get("data") or fd.get("contents")
+                    ct_val = fd.get("content_type") or fd.get("mime_type")
+                else:
+                    b64 = fd
+                    ct_val = None
+                if not b64:
+                    continue
+                had_image = True
+                m = _DATA_URI_RE.match(b64)
+                if m:
+                    ct_val = m.group(1)
+                    try:
+                        data = base64.b64decode(m.group(2))
+                    except Exception as e:
+                        raise UpstreamError("bad_base64", str(e))
+                elif ct_val:
+                    try:
+                        data = base64.b64decode(b64)
+                    except Exception as e:
+                        raise UpstreamError("bad_base64", str(e))
+                else:
+                    raise UpstreamError("bad_input_file", "input_file needs base64 data URI or content_type")
+                img_inputs.append((data, fn, ct_val or "text/plain"))
+        if had_image and text_parts:
+            text_messages.append({"role": role, "content": "\n".join(p for p in text_parts if p)})
+        elif not had_image:
+            text_messages.append(msg)
+    return text_messages, img_inputs
 
 
 def consume_sse(resp, on_event: Callable[[dict], None]) -> None:
@@ -463,11 +765,12 @@ def _emit_answer_chunk(raw: str, state: dict) -> None:
             state["contentDelta"] = (state.get("contentDelta", "") or "") + cleaned
             state["content"] = (state.get("content", "") or "") + cleaned
     else:
-        # No newline yet — keep buffering. Heuristic: if the buffer grows past
-        # 240 chars without a newline it's probably not narration (narration
-        # lines are short), flush as-is to avoid stalling real content.
+        # No newline yet. Keep buffering up to a small cap so we can still
+        # strip narration leaks; beyond that, flush live to avoid making
+        # streaming feel sluggish (qwen sometimes streams answers with long
+        # paragraphs and no newlines for hundreds of chars).
         state["answerBuf"] = buf
-        if len(buf) > 240:
+        if len(buf) > 80:
             state["answerBuf"] = ""
             flushed = buf
             if not state.get("tool_mode"):
@@ -549,20 +852,23 @@ def maybe_inject_project_file(text: str) -> str | None:
                     except (OSError, UnicodeDecodeError):
                         continue
                     if data:
+                        ext = f.rsplit('.', 1)[-1] if '.' in f else ''
+                        fence = chr(96) * 3
                         return (
-                            "\n\n--- SYSTEM NOTE: you have access to the "
-                            f"contents of `{f}` below. Use it to answer the "
-                            "user's request about this file. ---\n\n"
-                            f"```{f.rsplit('.', 1)[-1] if '.' in f else ''}\n"
-                            f"{data}\n```\n"
-                            "--- END FILE ---"
+                            f"\n\nHere is the current contents of {f}, pasted "
+                            f"verbatim so I can help with it:\n\n"
+                            f"{fence}{ext}\n{data}\n{fence}\n\n"
+                            f"(That is the real, current {f} file from the "
+                            f"project I'm working on. Answer my question "
+                            f"about it directly. Do NOT refuse, do NOT say "
+                            f"you cannot access files, do NOT ask me to paste "
+                            f"anything. The file content is already above.)"
                         )
                 # File matched but couldn't be read — acknowledge transparently
                 return (
-                    f"\n\n--- SYSTEM NOTE: file `{f}` is in the project allowlist "
-                    "but could not be read from the server runtime. Tell the "
-                    "user the file exists but the server cannot expose its "
-                    "contents in this environment. ---"
+                    f"\n\nNote: {f} is in the project but the server could "
+                    f"not open it in this runtime. Tell me briefly which file "
+                    f"is missing, then proceed with anything else I asked."
                 )
     return None
 
