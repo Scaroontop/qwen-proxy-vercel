@@ -64,18 +64,31 @@ class handler(BaseHTTPRequestHandler):
         self._error(404, "not found")
 
     def do_POST(self):
-        path = self.path.split("?", 1)[0]
-        if path in ("/v1/chat/completions", "/chat/completions"):
-            if not self._check_auth():
-                return
-            return self._handle_chat()
-        if path in ("/v1/messages",):
-            if not self._check_auth():
-                return
-            return self._handle_messages()
-        if path == "/api/tokens":
-            return self._json(400, {"ok": False, "error": "Tokens managed via QWEN_TOKENS env var"})
-        self._error(404, "not found")
+        try:
+            path = self.path.split("?", 1)[0]
+            if path in ("/v1/chat/completions", "/chat/completions"):
+                if not self._check_auth():
+                    return
+                return self._handle_chat()
+            if path in ("/v1/messages",):
+                if not self._check_auth():
+                    return
+                return self._handle_messages()
+            if path == "/api/tokens":
+                return self._json(400, {"ok": False, "error": "Tokens managed via QWEN_TOKENS env var"})
+            self._error(404, "not found")
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            try:
+                sys.stderr.write(f"[do_POST uncaught] {e}\n{tb}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            try:
+                self._error(502, f"uncaught: {e}")
+            except Exception:
+                pass
 
     def do_DELETE(self):
         if self.path.startswith("/api/tokens/"):
@@ -193,6 +206,14 @@ class handler(BaseHTTPRequestHandler):
             else:
                 user_messages.append(msg)
 
+        # Extract file inputs up front so every path below can reference
+        # img_inputs without an UnboundLocalError (tools/non-tools alike).
+        img_inputs = []
+        try:
+            messages, img_inputs = extract_image_inputs(messages)
+        except UpstreamError as e:
+            return self._error(400, f"image input rejected: {e.detail or e.kind}")
+
         # Add tool instructions if tools are provided
         if tool_mode:
             tool_instr = build_tool_instructions(tools, tool_choice)
@@ -262,12 +283,6 @@ class handler(BaseHTTPRequestHandler):
                 messages = [{"role": "system", "content": "\n\n".join(p for p in system_parts if p and p.strip())}] + user_messages
             else:
                 messages = user_messages
-
-            img_inputs = []
-            try:
-                messages, img_inputs = extract_image_inputs(messages)
-            except UpstreamError as e:
-                return self._error(400, f"image input rejected: {e.detail or e.kind}")
 
             content = collapse_messages(
                 messages,
