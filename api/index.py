@@ -1,6 +1,7 @@
 """Multi-provider API proxy with OpenAI + Anthropic format support."""
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import sys
@@ -22,8 +23,8 @@ from lib.qwen import (
     _flush_answer_buffer as flush_answer_buffer,
 )
 
-# API key - can be overridden via env
-API_KEY = os.environ.get("API_KEY", "nevinisgay")
+# API key — fail closed if unset. No source-visible default.
+API_KEY = os.environ.get("API_KEY", "").strip()
 
 # Model list with metadata — IDs must match what qwen.ai's web chat accepts.
 # Verified working: qwen3.8-max-preview (the others below share the same family
@@ -94,7 +95,7 @@ class handler(BaseHTTPRequestHandler):
                     return
                 return self._handle_chat()
             if path in ("/v1/messages",):
-                if not self._check_auth():
+                if not self._check_auth(anthropic=True):
                     return
                 return self._handle_messages()
             if path == "/api/tokens":
@@ -124,18 +125,43 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # ─── Auth ───
-    def _check_auth(self):
+    def _check_auth(self, *, anthropic: bool = False):
+        # Fail closed: a deployed proxy without a configured API_KEY must not
+        # accept traffic under any credential, including the OpenAI default.
+        if not API_KEY:
+            if anthropic:
+                self._anthropic_error(503, "api_error", "Server API_KEY not configured.")
+            else:
+                self._json(503, {
+                    "error": {
+                        "message": "Server API_KEY not configured.",
+                        "type": "server_error", "code": "api_key_unconfigured",
+                    }
+                })
+            return False
+        candidate = ""
         auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            candidate = auth[7:]
         x_key = self.headers.get("x-api-key", "")
-        if auth == f"Bearer {API_KEY}" or x_key == API_KEY:
+        ok = False
+        if candidate and hmac.compare_digest(candidate, API_KEY):
+            ok = True
+        elif x_key and hmac.compare_digest(x_key, API_KEY):
+            ok = True
+        if ok:
             return True
-        self._json(401, {
-            "error": {
-                "message": "Invalid API key. Use 'Authorization: Bearer <key>' or 'x-api-key: <key>'",
-                "type": "auth_error",
-                "code": "invalid_api_key"
-            }
-        })
+        if anthropic:
+            self._anthropic_error(401, "authentication_error",
+                                  "Invalid API key. Use 'Authorization: Bearer <key>'.")
+        else:
+            self._json(401, {
+                "error": {
+                    "message": "Invalid API key. Use 'Authorization: Bearer <key>' or 'x-api-key: <key>'",
+                    "type": "auth_error",
+                    "code": "invalid_api_key"
+                }
+            })
         return False
 
     # ─── /health ───
@@ -181,9 +207,24 @@ class handler(BaseHTTPRequestHandler):
         if body is None:
             return
 
-        model = resolve_model(body.get("model"))
+        try:
+            model = resolve_model(body.get("model"))
+        except UpstreamError as e:
+            return self._error(400, f"invalid model: {e.detail or e.kind}")
         cfg = get_config()
-        messages = body.get("messages") or []
+        messages_raw = body.get("messages")
+        if not isinstance(messages_raw, list):
+            return self._error(400, "`messages` must be an array")
+        messages = []
+        for m in messages_raw:
+            if not isinstance(m, dict):
+                return self._error(400, "each message must be a JSON object")
+            role = m.get("role")
+            if role not in ("system", "user", "assistant", "tool"):
+                return self._error(400, f"invalid message role: {role!r}")
+            if "content" not in m and "tool_calls" not in m:
+                return self._error(400, "message missing `content` or `tool_calls`")
+            messages.append(m)
         want_stream = body.get("stream") is True
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
@@ -201,9 +242,19 @@ class handler(BaseHTTPRequestHandler):
                 json_schema = response_format.get("json_schema", {}).get("schema")
 
         # ─── Tools + tool_choice ───
-        tools = body.get("tools") or []
+        tools = body.get("tools")
+        if tools is not None and not isinstance(tools, list):
+            return self._error(400, "`tools` must be an array")
+        tools = tools or []
+        for t in tools:
+            if not isinstance(t, dict):
+                return self._error(400, "each tool definition must be an object")
         tool_choice = body.get("tool_choice")
-        tool_mode = bool(tools)
+        # tool_choice == "none" means the caller explicitly does NOT want tool
+        # usage for this turn even though it shipped tool definitions. Treat
+        # that as plain chat so we don't prime the model with tool instructions
+        # only to have it call one anyway.
+        tool_mode = bool(tools) and tool_choice != "none"
 
         # ─── Prompt cache (passthrough acknowledgment) ───
         # OpenAI prompt_cache (cache_control / prompt_cache_key) - we accept
@@ -527,15 +578,19 @@ class handler(BaseHTTPRequestHandler):
                     "tool_mode": bool(tool_mode),
                 }
 
-                def on_event(frame):
-                    extract_delta(frame, state)
+                def emit_delta():
+                    # Flush whatever contentDelta the parser left for us, then
+                    # fold it into the running transcript. Centralizing the
+                    # send here means the post-consume flush finalization below
+                    # can re-invoke this to emit any tail the parser buffered
+                    # up after the last newline (which the old code dropped).
                     if state["reasoningDelta"]:
                         send({
                             "id": cid, "object": "chat.completion.chunk",
                             "created": created, "model": req_model,
                             "choices": [{
-                                "index": 0, 
-                                "delta": {"reasoning_content": state["reasoningDelta"]}, 
+                                "index": 0,
+                                "delta": {"reasoning_content": state["reasoningDelta"]},
                                 "finish_reason": None,
                                 "logprobs": None
                             }],
@@ -547,25 +602,55 @@ class handler(BaseHTTPRequestHandler):
                             "id": cid, "object": "chat.completion.chunk",
                             "created": created, "model": req_model,
                             "choices": [{
-                                "index": 0, 
-                                "delta": {"content": state["contentDelta"]}, 
+                                "index": 0,
+                                "delta": {"content": state["contentDelta"]},
                                 "finish_reason": None,
                                 "logprobs": None
                             }],
                             "system_fingerprint": None
                         })
+                        # Single owner of `content` now lives here, not in
+                        # lib/qwen._emit_answer_chunk (which only writes the
+                        # delta). Without this, streamed answers were fine
+                        # but non-streamed ones doubled up.
+                        state["content"] = (state.get("content", "") or "") + state["contentDelta"]
                         state["contentDelta"] = ""
 
+                def on_event(frame):
+                    extract_delta(frame, state)
+                    emit_delta()
+
+                stream_error = None
                 try:
                     consume_sse(resp, on_event)
-                except UpstreamError:
-                    # Headers were already sent when the stream opened, so we
-                    # cannot fail over to another token without corrupting the
-                    # committed HTTP response (re-sending status + headers).
-                    # Finalize with whatever content we buffered instead of
-                    # letting run_with_failover retry and garble the stream.
-                    pass
+                except UpstreamError as e:
+                    # Headers already sent when the stream opened, so we
+                    # cannot fail over without garbling the committed HTTP
+                    # response. Capture the error and surface it as a
+                    # visible OpenAI-shaped in-stream chunk so the client
+                    # sees WHY the reply is empty instead of a generic
+                    # 'no content' toast from its UI.
+                    stream_error = e
                 flush_answer_buffer(state)
+                # Emit any final delta that flush_answer_buffer just produced
+                # (e.g. a trailing partial line with no trailing newline) — it
+                # only writes contentDelta; the act of sending it to the
+                # client is on us here.
+                emit_delta()
+
+                if stream_error is not None and not state["content"].strip():
+                    send({
+                        "id": cid, "object": "chat.completion.chunk",
+                        "created": created, "model": req_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": f"[stream error: {stream_error.kind}]"},
+                            "finish_reason": None,
+                            "logprobs": None
+                        }],
+                        "system_fingerprint": None
+                    })
+                    state["content"] = f"[stream error: {stream_error.kind}]"
 
                 # If no answer content came through, fall back to reasoning
                 if not state["content"].strip() and state["reasoning"].strip():
@@ -660,7 +745,16 @@ class handler(BaseHTTPRequestHandler):
             return
 
         # Convert Anthropic format to internal
-        anthropic_messages = body.get("messages") or []
+        anthropic_messages = body.get("messages")
+        if not isinstance(anthropic_messages, list):
+            return self._anthropic_error(400, "invalid_request_error", "`messages` must be an array")
+        for m in anthropic_messages:
+            if not isinstance(m, dict):
+                return self._anthropic_error(400, "invalid_request_error", "each message must be a JSON object")
+            if m.get("role") not in ("user", "assistant"):
+                return self._anthropic_error(400, "invalid_request_error", f"invalid message role: {m.get('role')!r}")
+            if "content" not in m:
+                return self._anthropic_error(400, "invalid_request_error", "message missing `content`")
         system_prompt = body.get("system", "")
         
         # Convert to OpenAI-style messages
@@ -705,7 +799,10 @@ class handler(BaseHTTPRequestHandler):
             
             messages.append({"role": role, "content": content})
 
-        model = resolve_model(body.get("model"))
+        try:
+            model = resolve_model(body.get("model"))
+        except UpstreamError as e:
+            return self._anthropic_error(400, "invalid_request_error", f"invalid model: {e.detail or e.kind}")
         cfg = get_config()
         want_stream = body.get("stream") is True
         max_tokens = body.get("max_tokens", 4096)
@@ -863,9 +960,12 @@ class handler(BaseHTTPRequestHandler):
                 }
                 output_tokens = 0
 
-                def on_event(frame):
+                def emit_delta():
+                    # Send contentDelta and roll it into `content`. The trailing
+                    # flush (flush_answer_buffer) writes to contentDelta only,
+                    # so we call this again after consume_sse returns to make
+                    # sure the last partial line actually reaches the client.
                     nonlocal output_tokens
-                    extract_delta(frame, state)
                     if state["contentDelta"]:
                         send_event("content_block_delta", {
                             "type": "content_block_delta",
@@ -873,18 +973,41 @@ class handler(BaseHTTPRequestHandler):
                             "delta": {"type": "text_delta", "text": state["contentDelta"]}
                         })
                         output_tokens += len(state["contentDelta"]) // 4  # rough estimate
+                        # Single owner of `content` now lives here — the lib
+                        # parser only writes the delta (removing this caused
+                        # streamed answers to lose the fallback/stop_reason
+                        # branches that read state["content"]).
+                        state["content"] = (state.get("content", "") or "") + state["contentDelta"]
                         state["contentDelta"] = ""
 
+                def on_event(frame):
+                    extract_delta(frame, state)
+                    emit_delta()
+
+                stream_error = None
                 try:
                     consume_sse(resp, on_event)
-                except UpstreamError:
-                    # Headers were already sent when the stream opened, so we
-                    # cannot fail over to another token without corrupting the
-                    # committed HTTP response (re-sending status + headers).
-                    # Finalize with whatever content we buffered instead of
-                    # letting run_with_failover retry and garble the stream.
-                    pass
+                except UpstreamError as e:
+                    # Headers already sent when the stream opened, so we
+                    # cannot fail over without garbling the committed HTTP
+                    # response. Capture it and surface it via the
+                    # Anthropic content_block_delta event shape so the
+                    # client sees WHY the reply is empty instead of a
+                    # generic 'no content' toast.
+                    stream_error = e
                 flush_answer_buffer(state)
+                # Emit the tail delta that flush_answer_buffer just buffered
+                # (final partial line with no trailing newline).
+                emit_delta()
+
+                if stream_error is not None and not state["content"].strip():
+                    err_text = f"[stream error: {stream_error.kind}]"
+                    send_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": err_text}
+                    })
+                    state["content"] = err_text
 
                 # If no answer content came through, fall back to reasoning
                 if not state["content"].strip() and state["reasoning"].strip():
@@ -940,10 +1063,40 @@ class handler(BaseHTTPRequestHandler):
     def _read_body(self):
         try:
             length = int(self.headers.get("Content-Length") or 0)
-            return json.loads(self.rfile.read(length).decode() or "{}")
-        except Exception:
+        except (TypeError, ValueError):
+            self._error(400, "invalid Content-Length")
+            return None
+        # Hard cap. Most legitimate chat requests are well under 1MB; 10MB
+        # leaves room for a few base64 images. Going above this also blows
+        # Vercel's request budget silently, so reject early with 413 instead
+        # of waiting for the function to be killed.
+        MAX_BODY = 10 * 1024 * 1024
+        if length < 0:
+            self._error(400, "invalid Content-Length")
+            return None
+        if length > MAX_BODY:
+            self._error(413, f"request body too large (>{MAX_BODY} bytes)")
+            return None
+        # Reject multipart/form-data and other non-JSON payloads early so we
+        # can return a clear 415 rather than letting the JSON parse fail later
+        # with a misleading "invalid JSON body" 400.
+        ct = (self.headers.get("Content-Type") or "").lower().split(";")[0].strip()
+        if ct and ct not in ("application/json", "text/json", "application/json-patch+json"):
+            self._json(415, {"error": {"message": f"unsupported Content-Type: {ct or 'missing'}", "type": "invalid_request_error", "code": "unsupported_media_type"}})
+            return None
+        try:
+            raw = self.rfile.read(length) if length else b"{}"
+            data = json.loads(raw.decode() or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
             self._error(400, "invalid JSON body")
             return None
+        except Exception:
+            self._error(400, "could not read request body")
+            return None
+        if not isinstance(data, dict):
+            self._error(400, "request body must be a JSON object")
+            return None
+        return data
 
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
