@@ -313,7 +313,7 @@ button.sm { padding: 5px 11px; font-size: 12px; border-radius: 6px; }
     <p class="hint">Configure your API key and view endpoint information. The API supports both OpenAI and Anthropic formats.</p>
     
     <label>API Key</label>
-    <input type="text" id="apiKeyInput" placeholder="nevinisgay" />
+    <input type="text" id="apiKeyInput" placeholder="your key here" />
     
     <div class="info-grid">
       <div class="info-item">
@@ -402,40 +402,51 @@ function renderMd(text) {
   // hr
   html = html.replace(/^---$/gm, '<hr>');
 
-  // links
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // links — whitelist URL schemes to kill javascript:/data: XSS sinks.
+  // esc() runs first but only escapes & < > " ', not the URI scheme itself.
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => {
+    const safe = /^(https?:|mailto:|#)/i.test(url) ? url : '#';
+    return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+  });
 
   // lists - improved handling
   html = html.replace(/^[\-\*] (.+)$/gm, '<li>$1</li>');
   html = html.replace(/((?:<li>.*?<\/li>\n?)+)/g, '<ul>$1</ul>');
   
-  html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/^\d+\. (.+)$/gm, '<li data-ol="1">$1</li>');
   const tempDiv = document.createElement('div');
   tempDiv.innerHTML = html;
-  const lis = tempDiv.querySelectorAll('li');
-  let inOl = false;
-  let olBuffer = [];
+  // Walk top-level children of tempDiv. Since <li> parsed loose becomes a
+  // direct child here (no <ol>/<ul> wrapper yet), we group consecutive
+  // ordered <li data-ol> into an <ol>, unordered <li> (no data-ol) into a
+  // <ul>, and emit everything else verbatim. The prior `!node.parentElement`
+  // test was always false because parse always sets parentElement to tempDiv.
   let result = [];
-  
+  let olBuf = [];
+  let ulBuf = [];
+  const flushOL = () => { if (olBuf.length) { result.push('<ol>' + olBuf.join('') + '</ol>'); olBuf = []; } };
+  const flushUL = () => { if (ulBuf.length) { result.push('<ul>' + ulBuf.join('') + '</ul>'); ulBuf = []; } };
+
   Array.from(tempDiv.childNodes).forEach(node => {
-    if (node.nodeName === 'LI' && !node.parentElement) {
-      if (!inOl) {
-        inOl = true;
-        olBuffer = [];
+    if (node.nodeName === 'LI' && node.parentElement === tempDiv) {
+      const isOl = node.getAttribute && node.getAttribute('data-ol') === '1';
+      // Strip the marker so it doesn't leak into output.
+      if (isOl) {
+        flushUL();
+        node.removeAttribute && node.removeAttribute('data-ol');
+        olBuf.push(node.outerHTML);
+      } else {
+        flushOL();
+        ulBuf.push(node.outerHTML);
       }
-      olBuffer.push(node.outerHTML);
     } else {
-      if (inOl) {
-        result.push('<ol>' + olBuffer.join('') + '</ol>');
-        olBuffer = [];
-        inOl = false;
-      }
-      result.push(node.outerHTML || node.textContent);
+      flushOL();
+      flushUL();
+      result.push(node.outerHTML || node.textContent || '');
     }
   });
-  if (inOl) {
-    result.push('<ol>' + olBuffer.join('') + '</ol>');
-  }
+  flushOL();
+  flushUL();
   html = result.join('');
 
   // paragraphs
@@ -591,8 +602,11 @@ function setSendBtnState() {
   }
 }
 
-async function send() {
-  const text = inputEl.value.trim();
+async function send(explicitText) {
+  // explicitText lets callers (the pendingText queue) hand in the queued
+  // message directly, bypassing the input-empty check. Otherwise the queue
+  // would be silently dropped — the input was cleared before abort happened.
+  const text = (explicitText !== undefined ? explicitText : inputEl.value).trim();
   // If streaming, abort the current stream. If user typed new text, queue it
   // to be sent immediately after the abort completes — no waiting allowed.
   if (busy) {
@@ -609,6 +623,13 @@ async function send() {
 
   addUserMsg(text);
   history.push({ role: 'user', content: text });
+  // Sliding window — qwen has a context ceiling and 50 turns in will 400 the
+  // request. Keep the most recent N messages (drop oldest, never the system
+  // turn since we don't store one client-side anyway).
+  const MAX_HISTORY = 40;
+  if (history.length > MAX_HISTORY) {
+    history.splice(0, history.length - MAX_HISTORY);
+  }
 
   const bot = addBotMsg();
   let answer = '';
@@ -674,6 +695,11 @@ async function send() {
               reasoning += delta.reasoning_content;
               bot.reasoning.style.display = '';
               bot.reasoning.textContent = reasoning;
+              // Bind the toggle during streaming so long reasoning traces
+              // can be collapsed while still pouring in. Idempotent — if
+              // already bound, reassigning the same handler is a no-op.
+              const toggleCollapsed = () => bot.reasoning.classList.toggle('collapsed');
+              bot.reasoning.onclick = toggleCollapsed;
             }
             if (delta.content) {
               if (firstContent) {
@@ -750,7 +776,7 @@ async function send() {
     inputEl.focus();
     const queued = pendingText;
     pendingText = null;
-    if (queued) send();
+    if (queued) send(queued);
   }
 }
 
