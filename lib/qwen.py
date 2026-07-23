@@ -521,6 +521,30 @@ def extract_image_inputs(messages: list[dict]) -> tuple[list[dict], list[tuple[b
                 else:
                     raise UpstreamError("bad_input_file", "input_file needs base64 data URI or content_type")
                 img_inputs.append((data, fn, ct_val or "text/plain"))
+                # If the attached file is text-like (.html/.txt/.py/.json/etc.),
+                # also inline its decoded contents into the user message. qwen's
+                # web chat treats `files` entries as sidebar vision attachments
+                # and does NOT paste text-file contents into the prompt the model
+                # sees — so without this the model hallucinates analysis of a
+                # file it never actually read. Cap at 200 KB to avoid blowing
+                # the prompt budget on giant files.
+                _ct = (ct_val or "").lower().split(";")[0].strip()
+                if _ct.startswith("text/") or _ct in _DOC_MIME_FILETYPE:
+                    try:
+                        decoded = data[: 200 * 1024].decode("utf-8", errors="replace")
+                    except Exception:
+                        decoded = ""
+                    if decoded:
+                        fence = chr(96) * 3
+                        lang = fn.rsplit(".", 1)[-1] if "." in fn else ""
+                        text_parts.append(
+                            f"\n\nHere is the full contents of {fn}:\n\n"
+                            f"{fence}{lang}\n{decoded}\n{fence}\n"
+                            f"\n(That is the real contents of {fn}, uploaded by "
+                            f"the user. Answer questions about it directly. Do "
+                            f"NOT say you cannot view it. Do NOT ask the user to "
+                            f"paste it.)"
+                        )
         if had_image and text_parts:
             text_messages.append({"role": role, "content": "\n".join(p for p in text_parts if p)})
         elif not had_image:
