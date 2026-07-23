@@ -198,7 +198,8 @@ button.sm { padding: 5px 11px; font-size: 12px; border-radius: 6px; }
   line-height: 1.5; padding: 11px 14px; border-radius: 8px;
   font-size: 14px;
 }
-#sendBtn { border-radius: 8px; padding: 11px 20px; font-weight: 700; }
+#sendBtn { border-radius: 8px; padding: 11px 20px; font-weight: 700; transition: background .15s, color .15s; }
+#sendBtn.stop { background: var(--danger, #e5484d); color: #fff; }
 
 
 /* ─── Overlays ─── */
@@ -355,6 +356,7 @@ const $ = id => document.getElementById(id);
 const chatEl = $('chat'), inputEl = $('input'), sendBtn = $('sendBtn');
 const history = [];
 let busy = false;
+let activeController = null;  // AbortController for the in-flight stream
 let apiKey = localStorage.getItem('apiKey') || '';
 
 // ─── Stateless multi-turn state ───
@@ -576,11 +578,28 @@ async function loadModels() {
 }
 
 // ─── Send message ───
+function setSendBtnState() {
+  if (busy) {
+    sendBtn.textContent = 'Stop';
+    sendBtn.disabled = false;
+    sendBtn.classList.add('stop');
+  } else {
+    sendBtn.textContent = 'Send';
+    sendBtn.disabled = false;
+    sendBtn.classList.remove('stop');
+  }
+}
+
 async function send() {
+  // If streaming, treat Send button as Stop
+  if (busy) {
+    if (activeController) activeController.abort();
+    return;
+  }
   const text = inputEl.value.trim();
-  if (!text || busy) return;
+  if (!text) return;
   busy = true;
-  sendBtn.disabled = true;
+  setSendBtnState();
   inputEl.value = '';
   inputEl.style.height = 'auto';
 
@@ -590,6 +609,8 @@ async function send() {
   const bot = addBotMsg();
   let answer = '';
   let reasoning = '';
+  const ctrl = new AbortController();
+  activeController = ctrl;
 
   try {
     const payload = {
@@ -609,7 +630,7 @@ async function send() {
       headers: headers,
       cache: 'no-store',
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(55000),
+      signal: ctrl.signal,
     });
 
     if (!r.ok) {
@@ -687,7 +708,7 @@ async function send() {
 
     if (answer.trim()) {
       history.push({ role: 'assistant', content: answer });
-    } else if (!reasoning) {
+    } else if (!reasoning && !ctrl.signal.aborted) {
       bot.typing.style.display = 'none';
       bot.content.style.display = '';
       bot.content.innerHTML = '<em style="color:var(--dim)">(empty reply)</em>';
@@ -702,13 +723,25 @@ async function send() {
     }
 
   } catch (e) {
-    bot.el.className = 'msg err';
-    bot.el.querySelector('.bubble').textContent = 'Error: ' + (e.message || e);
-    // remove the failed user msg from history
-    history.pop();
+    if (ctrl.signal.aborted || e.name === 'AbortError') {
+      // user-cancelled stream: keep whatever content we got
+      bot.typing.style.display = 'none';
+      if (answer.trim()) {
+        history.push({ role: 'assistant', content: answer });
+      } else {
+        bot.content.style.display = '';
+        bot.content.innerHTML = '<em style="color:var(--dim)">(stopped)</em>';
+      }
+    } else {
+      bot.el.className = 'msg err';
+      bot.el.querySelector('.bubble').textContent = 'Error: ' + (e.message || e);
+      // remove the failed user msg from history
+      history.pop();
+    }
   } finally {
     busy = false;
-    sendBtn.disabled = false;
+    activeController = null;
+    setSendBtnState();
     scrollBottom();
     inputEl.focus();
   }
