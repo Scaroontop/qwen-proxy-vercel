@@ -673,6 +673,9 @@ async function send(explicitText) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
+      // Normalize CRLF/CR → LF so both \n\n and \r\n\r\n delimiters frame
+      // correctly without splitting mid-byte or buffering the whole stream.
+      if (buf.includes('\r')) buf = buf.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
       let idx;
       while ((idx = buf.indexOf('\n\n')) >= 0) {
@@ -718,6 +721,7 @@ async function send(explicitText) {
 
     // flush trailing
     if (buf.trim()) {
+      if (buf.includes('\r')) buf = buf.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
       for (const line of buf.split('\n')) {
         if (!line.startsWith('data:')) continue;
         const raw = line.slice(5).trim();
