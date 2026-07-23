@@ -272,6 +272,109 @@ def track_ids(frame: dict, state: dict) -> None:
         state["last_msg_id"] = rid
 
 
+# ─── Thinking-narration leak filter ─────────────────────────────────
+# Qwen sometimes echoes its internal thinking phase into the answer:
+#   "Assessing the request to fix index.html"
+#   "I am interpreting the user's need..."
+#   "I consider the context of..."
+#   "My focus is on delivering..."
+# These lines start with present-tense verb-ing / "I" self-narration and
+# are never part of a real answer. Strip them.
+
+_NARRATION_PREFIXES = (
+    "assessing", "considering", "interpreting", "analyzing",
+    "evaluating", "examining", "reviewing", "determining",
+    "attempting", "navigating", "proceeding", "responding to",
+    "i am interpreting", "i am assessing", "i am considering",
+    "i am analyzing", "i am evaluating", "i am working",
+    "i am trying", "i am responding", "i consider", "i interpret",
+    "i assess", "i analyze", "i will", "i should", "i need to",
+    "i am going to", "i plan to", "trying to", "let me", "let's",
+    "my focus is", "my goal is", "my approach",
+    "the path is", "the user", "this is a",
+)
+
+
+def strip_thinking_narration(text: str) -> str:
+    if not text or not text.strip():
+        return text
+    lines = text.split("\n")
+    kept = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            kept.append(line)
+            continue
+        low = s.lower()
+        if any(low.startswith(p) for p in _NARRATION_PREFIXES):
+            if len(s) < 120 and "`" not in s and "{" not in s and "def " not in s:
+                continue
+        kept.append(line)
+    out = "\n".join(kept)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+_TC_KEY = '"tool_calls"'
+_TC_OPEN = '['
+_TC_CLOSE = ']'
+
+
+def _strip_raw_toolcalls_json(text: str) -> str:
+    """Remove hallucinated raw {"tool_calls":[...]} blocks from text when the
+    caller did NOT request tools. Qwen occasionally hallucinates tool-call
+    JSON into the answer phase (e.g. pretending to invoke 'Bash')."""
+    if not text or _TC_KEY not in text:
+        return text
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        idx = text.find(_TC_KEY, i)
+        if idx < 0:
+            out.append(text[i:])
+            break
+        # Find the enclosing object start: walk backwards to the opening '{'
+        obj_start = text.rfind('{', 0, idx)
+        if obj_start < 0:
+            out.append(text[i:idx + len(_TC_KEY)])
+            i = idx + len(_TC_KEY)
+            continue
+        # Find matching closing brace for the tool_calls object
+        depth = 0
+        j = obj_start
+        in_str = False
+        esc = False
+        end = -1
+        while j < n:
+            c = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == '\\':
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = j
+                        break
+            j += 1
+        if end < 0:
+            out.append(text[i:])
+            break
+        # Drop from obj_start to end (inclusive). Emit text before it.
+        out.append(text[i:obj_start])
+        i = end + 1
+    return "".join(out)
+
+
 def extract_delta(frame: dict, state: dict) -> None:
     track_ids(frame, state)
     d = ((frame.get("choices") or [{}])[0] or {}).get("delta")
@@ -296,30 +399,75 @@ def extract_delta(frame: dict, state: dict) -> None:
         return
     if d.get("phase") == "answer":
         if d.get("content"):
-            content = d["content"]
-            # Strip qwen's internal markers but preserve actual content
-            content = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', content, flags=re.DOTALL)
-            content = re.sub(r'<\|tool_call\|>.*?<\|tool_call_end\|>', '', content, flags=re.DOTALL)
-            content = re.sub(r'<\|im_start\|>', '', content)
-            content = re.sub(r'<\|im_end\|>', '', content)
-            content = re.sub(r'<\|tool_call\|>', '', content)
-            content = re.sub(r'<\|tool_call_end\|>', '', content)
-            content = re.sub(r'<\|name\>.*?</name\|>', '', content)
-            state["contentDelta"] = content
+            _emit_answer_chunk(d["content"], state)
         if d.get("status") == "finished":
             state["finished"] = True
+            # Flush any buffered partial line at end of stream
+            _flush_answer_buffer(state)
         return
     if d.get("content") and not d.get("phase"):
-        content = d["content"]
-        # Strip qwen's internal markers but preserve actual content
-        content = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', content, flags=re.DOTALL)
-        content = re.sub(r'<\|tool_call\|>.*?<\|tool_call_end\|>', '', content, flags=re.DOTALL)
-        content = re.sub(r'<\|im_start\|>', '', content)
-        content = re.sub(r'<\|im_end\|>', '', content)
-        content = re.sub(r'<\|tool_call\|>', '', content)
-        content = re.sub(r'<\|tool_call_end\|>', '', content)
-        content = re.sub(r'<\|name\>.*?</name\|>', '', content)
-        state["contentDelta"] = content
+        _emit_answer_chunk(d["content"], state)
+
+
+def _emit_answer_chunk(raw: str, state: dict) -> None:
+    """Buffer answer content by line, strip narration leaks, emit clean lines.
+
+    Qwen sometimes leaks its thinking-phase narration ("Assessing the request...",
+    "I am interpreting...") into the answer phase. We hold content until we see a
+    newline, then run strip_thinking_narration on the completed line. Partial
+    trailing content (no newline) stays buffered until the next chunk or finish.
+    """
+    buf = state.get("answerBuf", "")
+    buf += raw
+    # Strip internal markers from the whole buffered text first — this lets
+    # multi-chunk <|im_start|>...<|im_end|> blocks get cleaned even if the
+    # opening and closing tags land in separate chunks.
+    buf = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', buf, flags=re.DOTALL)
+    buf = re.sub(r'<\|tool_call\|>.*?<\|tool_call_end\|>', '', buf, flags=re.DOTALL)
+    buf = re.sub(r'<\|im_start\|>', '', buf)
+    buf = re.sub(r'<\|im_end\|>', '', buf)
+    buf = re.sub(r'<\|tool_call\|>', '', buf)
+    buf = re.sub(r'<\|tool_call_end\|>', '', buf)
+    buf = re.sub(r'<\|name\>.*?</name\|>', '', buf)
+
+    # Split off complete lines, keep the trailing partial line buffered.
+    if "\n" in buf:
+        idx = buf.rfind("\n")
+        complete = buf[:idx + 1]
+        state["answerBuf"] = buf[idx + 1:]
+        cleaned = strip_thinking_narration(complete)
+        if not state.get("tool_mode"):
+            cleaned = _strip_raw_toolcalls_json(cleaned)
+        if cleaned:
+            state["contentDelta"] = (state.get("contentDelta", "") or "") + cleaned
+            state["content"] = (state.get("content", "") or "") + cleaned
+    else:
+        # No newline yet — keep buffering. Heuristic: if the buffer grows past
+        # 240 chars without a newline it's probably not narration (narration
+        # lines are short), flush as-is to avoid stalling real content.
+        state["answerBuf"] = buf
+        if len(buf) > 240:
+            state["answerBuf"] = ""
+            flushed = buf
+            if not state.get("tool_mode"):
+                flushed = _strip_raw_toolcalls_json(flushed)
+            if flushed:
+                state["contentDelta"] = (state.get("contentDelta", "") or "") + flushed
+                state["content"] = (state.get("content", "") or "") + flushed
+
+
+def _flush_answer_buffer(state: dict) -> None:
+    """Emit any leftover buffered content at end of stream."""
+    buf = state.get("answerBuf", "")
+    if not buf:
+        return
+    state["answerBuf"] = ""
+    cleaned = strip_thinking_narration(buf)
+    if not state.get("tool_mode"):
+        cleaned = _strip_raw_toolcalls_json(cleaned)
+    if cleaned:
+        state["contentDelta"] = (state.get("contentDelta", "") or "") + cleaned
+        state["content"] = (state.get("content", "") or "") + cleaned
 
 
 # ─── Message collapsing (same logic) ──────────────────────────────
@@ -391,7 +539,7 @@ def collapse_messages(messages: list, *, tool_mode: bool = False, include_histor
     return last_user
 
 
-# ─── Tool mode helpers ─────────────────────────────────────────────
+# ─── Message collapsing ends; tool-mode helpers below ──────────────
 
 def build_tool_instructions(tools: list, tool_choice: Any) -> str:
     defs = [t.get("function") or t for t in tools]
