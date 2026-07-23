@@ -467,7 +467,14 @@ class handler(BaseHTTPRequestHandler):
 
             self._json(200, resp_obj)
         except UpstreamError as e:
-            status = 400 if e.kind == "bad_request" else 401 if e.kind == "no_tokens" else 502
+            if e.kind == "challenge":
+                status = 503
+            elif e.kind == "bad_request":
+                status = 400
+            elif e.kind == "no_tokens":
+                status = 401
+            else:
+                status = 502
             self._error(status, e.detail or e.kind)
         except Exception as e:
             self._error(502, str(e))
@@ -621,7 +628,8 @@ class handler(BaseHTTPRequestHandler):
             run_with_failover(work)
         except UpstreamError as e:
             try:
-                self._error(502, e.detail or e.kind)
+                status = 503 if e.kind == "challenge" else 502
+                self._error(status, e.detail or e.kind)
             except Exception:
                 pass
         except Exception as e:
@@ -891,6 +899,12 @@ class handler(BaseHTTPRequestHandler):
                 return True
 
             run_with_failover(work)
+        except UpstreamError as e:
+            try:
+                status = 503 if e.kind == "challenge" else 502
+                self._anthropic_error(status, "api_error", e.detail or e.kind)
+            except Exception:
+                pass
         except Exception as e:
             try:
                 self._anthropic_error(502, "api_error", str(e))
