@@ -16,6 +16,7 @@ from lib.qwen import (
     extract_delta, collapse_messages, resolve_model,
     run_with_failover, UpstreamError, load_tokens, get_config, flatten_content,
     build_tool_instructions, try_parse_tool_calls,
+    strip_thinking_narration, _strip_raw_toolcalls_json as strip_raw_toolcalls,
 )
 
 # API key - can be overridden via env
@@ -198,7 +199,16 @@ class handler(BaseHTTPRequestHandler):
                 else:
                     system_parts.append("You must respond with valid JSON only. Do not include any text outside the JSON object.")
             else:
-                system_parts.append("You are a helpful AI assistant. Respond in English using plain text only. Do not use any special formatting, tool syntax, XML tags, or internal markers in your response.")
+                system_parts.append(
+                    "You are a helpful AI assistant.\n"
+                    "RULES:\n"
+                    "- Answer the user's latest message directly and concisely.\n"
+                    "- Do NOT narrate your reasoning process (no 'Assessing...', 'Considering...', 'I interpret...').\n"
+                    "- Do NOT describe what you are doing before doing it. Just do it.\n"
+                    "- Do NOT pretend to have or lack tools, file access, or environments you don't have. Answer based only on the text in the conversation.\n"
+                    "- Respond in English using plain text only. No special formatting, tool syntax, XML tags, or internal markers.\n"
+                    "- If the user asks you to fix or edit a file/code, provide the corrected code in a code block. Do not ask the user to paste it unless it is genuinely missing from the conversation.\n"
+                )
 
             # Rebuild messages with combined system prompt
             if system_parts:
@@ -230,6 +240,8 @@ class handler(BaseHTTPRequestHandler):
                     "reasoning": "", "reasoningDelta": "", "contentDelta": "",
                     "content": "", "finished": False, "usage": None,
                     "chat_id": chat_id, "response_id": None,
+                    "answerBuf": "",
+                    "tool_mode": bool(tool_mode),
                 }
                 def on_event(frame):
                     extract_delta(frame, state)
@@ -254,6 +266,10 @@ class handler(BaseHTTPRequestHandler):
             content_text = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', content_text, flags=re.DOTALL)
             content_text = re.sub(r'<\|tool_call\|>.*?<\|tool_call_end\|>', '', content_text, flags=re.DOTALL)
             content_text = re.sub(r'<\|[^|]+\|>', '', content_text)
+            content_text = strip_thinking_narration(content_text)
+            # Strip hallucinated raw tool_calls JSON when caller did NOT request tools
+            if not tool_mode:
+                content_text = strip_raw_toolcalls(content_text)
             content_text = content_text.strip()
 
             # ─── JSON mode enforcement ───
@@ -389,6 +405,8 @@ class handler(BaseHTTPRequestHandler):
                     "reasoning": "", "reasoningDelta": "", "contentDelta": "",
                     "content": "", "finished": False, "usage": None,
                     "chat_id": chat_id, "response_id": None,
+                    "answerBuf": "",
+                    "tool_mode": bool(tool_mode),
                 }
 
                 def on_event(frame):
@@ -424,12 +442,13 @@ class handler(BaseHTTPRequestHandler):
 
                 # If no answer content came through, fall back to reasoning
                 if not state["content"].strip() and state["reasoning"].strip():
+                    fb = strip_thinking_narration(state["reasoning"])
                     send({
                         "id": cid, "object": "chat.completion.chunk",
                         "created": created, "model": req_model,
                         "choices": [{
                             "index": 0, 
-                            "delta": {"content": state["reasoning"]}, 
+                            "delta": {"content": fb}, 
                             "finish_reason": None,
                             "logprobs": None
                         }],
@@ -558,6 +577,8 @@ class handler(BaseHTTPRequestHandler):
                     "reasoning": "", "reasoningDelta": "", "contentDelta": "",
                     "content": "", "finished": False, "usage": None,
                     "chat_id": chat_id, "response_id": None,
+                    "answerBuf": "",
+                    "tool_mode": False,
                 }
                 def on_event(frame):
                     extract_delta(frame, state)
@@ -581,8 +602,10 @@ class handler(BaseHTTPRequestHandler):
             content_text = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', content_text, flags=re.DOTALL)
             content_text = re.sub(r'<\|tool_call\|>.*?<\|tool_call_end\|>', '', content_text, flags=re.DOTALL)
             content_text = re.sub(r'<\|[^|]+\|>', '', content_text)
+            content_text = strip_thinking_narration(content_text)
+            content_text = strip_raw_toolcalls(content_text)
             content_text = content_text.strip()
-            
+
             resp_obj = {
                 "id": msg_id,
                 "type": "message",
@@ -648,6 +671,8 @@ class handler(BaseHTTPRequestHandler):
                     "reasoning": "", "reasoningDelta": "", "contentDelta": "",
                     "content": "", "finished": False, "usage": None,
                     "chat_id": chat_id, "response_id": None,
+                    "answerBuf": "",
+                    "tool_mode": False,
                 }
                 output_tokens = 0
 
@@ -667,10 +692,11 @@ class handler(BaseHTTPRequestHandler):
 
                 # If no answer content came through, fall back to reasoning
                 if not state["content"].strip() and state["reasoning"].strip():
+                    fb = strip_thinking_narration(state["reasoning"])
                     send_event("content_block_delta", {
                         "type": "content_block_delta",
                         "index": 0,
-                        "delta": {"type": "text_delta", "text": state["reasoning"]}
+                        "delta": {"type": "text_delta", "text": fb}
                     })
                     state["content"] = state["reasoning"]
 
