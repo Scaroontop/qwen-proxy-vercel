@@ -18,6 +18,7 @@ from lib.qwen import (
     build_tool_instructions, try_parse_tool_calls,
     strip_thinking_narration, _strip_raw_toolcalls_json as strip_raw_toolcalls,
     maybe_inject_project_file,
+    extract_image_inputs, upload_image_to_oss,
 )
 
 # API key - can be overridden via env
@@ -35,6 +36,17 @@ MODELS = [
     {"id": "qwen3-8b", "name": "Qwen 3 8B", "context": 32000},
     {"id": "qwen3-next-80b-a3b", "name": "Qwen 3 Next 80B A3B", "context": 32000},
 ]
+
+
+def _upload_files(tok, img_inputs):
+    """Upload all OpenAI-format image inputs to qwen OSS using the provided
+    token's cookie. Returns the qwen `files` array or None when empty."""
+    if not img_inputs:
+        return None
+    out = []
+    for triple in img_inputs:
+        out.append(upload_image_to_oss(tok, triple[0], triple[1], triple[2]))
+    return out
 
 
 class handler(BaseHTTPRequestHandler):
@@ -222,12 +234,18 @@ class handler(BaseHTTPRequestHandler):
                         last["content"] = (last_text + injected)
                         if not force_json:
                             injected_note = (
-                                " You may be shown the contents of a project "
-                                "file via a 'SYSTEM NOTE' block in the user "
-                                "message. When that happens, treat it as your "
-                                "source of truth for that file. Answer the "
-                                "user's request about it directly. Do NOT "
-                                "narrate that you are reading it; just use it."
+                                " IMPORTANT: in some of the user's messages "
+                                "you will see the actual contents of project "
+                                "files pasted in directly with the phrasing "
+                                "'Here is the current contents of <file>, "
+                                "pasted verbatim'. That content is real and "
+                                "authoritative — you are NOT being asked to "
+                                "access a filesystem; the data is already in "
+                                "the message. Answer the user's request about "
+                                "that file directly. Do NOT say you cannot "
+                                "access files. Do NOT say you lack a tool. "
+                                "Do NOT ask the user to paste anything. Do NOT "
+                                "narrate reading the file. Just answer."
                             )
 
             if injected_note and system_parts:
@@ -245,17 +263,23 @@ class handler(BaseHTTPRequestHandler):
             else:
                 messages = user_messages
 
+            img_inputs = []
+            try:
+                messages, img_inputs = extract_image_inputs(messages)
+            except UpstreamError as e:
+                return self._error(400, f"image input rejected: {e.detail or e.kind}")
+
             content = collapse_messages(
                 messages,
                 tool_mode=False,
                 include_history=(not chat_id and len(messages) > 1),
             )
 
-        if not content.strip():
+        if not content.strip() and not img_inputs:
             return self._error(400, "messages array produced empty content")
 
         if want_stream:
-            return self._stream_chat(model, content, cid, created, req_model, chat_id, parent_id, cfg, force_json, tool_mode, tools)
+            return self._stream_chat(model, content, cid, created, req_model, chat_id, parent_id, cfg, force_json, tool_mode, tools, img_inputs)
 
         # Non-streaming
         try:
@@ -264,7 +288,7 @@ class handler(BaseHTTPRequestHandler):
                 if not chat_id:
                     chat_id = create_chat(tok, model)
                     parent_id = None
-                resp = open_completion_stream(tok, chat_id, model, content, parent_id=parent_id, auto_search=cfg["autoSearch"])
+                resp = open_completion_stream(tok, chat_id, model, content, parent_id=parent_id, auto_search=cfg["autoSearch"], files=_upload_files(tok, img_inputs))
                 state = {
                     "reasoning": "", "reasoningDelta": "", "contentDelta": "",
                     "content": "", "finished": False, "usage": None,
@@ -397,14 +421,14 @@ class handler(BaseHTTPRequestHandler):
             self._error(502, str(e))
 
     # ─── OpenAI streaming ───
-    def _stream_chat(self, model, content, cid, created, req_model, chat_id, parent_id, cfg, force_json=False, tool_mode=False, tools=None):
+    def _stream_chat(self, model, content, cid, created, req_model, chat_id, parent_id, cfg, force_json=False, tool_mode=False, tools=None, img_inputs=None):
         try:
             def work(tok):
                 nonlocal chat_id, parent_id
                 if not chat_id:
                     chat_id = create_chat(tok, model)
                     parent_id = None
-                resp = open_completion_stream(tok, chat_id, model, content, parent_id=parent_id, auto_search=cfg["autoSearch"])
+                resp = open_completion_stream(tok, chat_id, model, content, parent_id=parent_id, auto_search=cfg["autoSearch"], files=_upload_files(tok, img_inputs))
 
                 self.send_response(200)
                 self._cors()
@@ -575,11 +599,34 @@ class handler(BaseHTTPRequestHandler):
             
             # Handle content array or string
             if isinstance(content, list):
-                text_parts = []
+                # Normalize Anthropic image blocks to OpenAI image_url format so
+                # extract_image_inputs can pull them out for OSS upload.
+                normalized = []
                 for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                content = "\n".join(text_parts)
+                    if not isinstance(block, dict):
+                        normalized.append({"type": "text", "text": str(block)})
+                        continue
+                    bt = block.get("type")
+                    if bt == "text":
+                        normalized.append(block)
+                    elif bt == "image":
+                        src = block.get("source") or {}
+                        mt = src.get("media_type") or "image/png"
+                        data = src.get("data") or ""
+                        data_uri = f"data:{mt};base64,{data}"
+                        normalized.append({"type": "image_url", "image_url": {"url": data_uri}})
+                    elif bt == "document":
+                        # Anthropic document block (PDF/etc) to input_file.
+                        src = block.get("source") or {}
+                        mt = src.get("media_type") or "application/pdf"
+                        data = src.get("data") or ""
+                        data_uri = f"data:{mt};base64,{data}"
+                        fn = block.get("filename") or f"document.{mt.split(chr(47))[-1]}"
+                        normalized.append({"type": "input_file", "filename": fn, "file_data": data_uri})
+                    else:
+                        # Unknown block type — keep as text
+                        normalized.append({"type": "text", "text": json.dumps(block)})
+                content = normalized
             
             messages.append({"role": role, "content": content})
 
@@ -602,28 +649,39 @@ class handler(BaseHTTPRequestHandler):
                 if injected:
                     last["content"] = (last_text + injected)
                     nudged_system = (
-                        " You may be shown the contents of a project file via a "
-                        "'SYSTEM NOTE' block in the user message. When that "
-                        "happens, treat it as your source of truth for that "
-                        "file. Answer the user's request about it directly. Do "
-                        "NOT narrate that you are reading it; just use it."
+                        " IMPORTANT: in some of the user's messages you will "
+                        "see the actual contents of project files pasted in "
+                        "directly with the phrasing 'Here is the current "
+                        "contents of <file>, pasted verbatim'. That content "
+                        "is real and authoritative — you are NOT being asked "
+                        "to access a filesystem; the data is already in the "
+                        "message. Answer the user's request about that file "
+                        "directly. Do NOT say you cannot access files. Do NOT "
+                        "say you lack a tool. Do NOT ask the user to paste "
+                        "anything. Do NOT narrate reading the file. Just answer."
                     )
                 break
         if nudged_system and messages and messages[0].get("role") == "system":
             messages[0]["content"] = (flatten_content(messages[0].get("content", "")) or "") + nudged_system
 
+        img_inputs = []
+        try:
+            messages, img_inputs = extract_image_inputs(messages)
+        except UpstreamError as e:
+            return self._anthropic_error(400, "invalid_request_error", f"image input rejected: {e.detail or e.kind}")
+
         content = collapse_messages(messages, tool_mode=False, include_history=True)
-        if not content.strip():
+        if not content.strip() and not img_inputs:
             return self._anthropic_error(400, "invalid_request_error", "messages array produced empty content")
 
         if want_stream:
-            return self._stream_messages(model, content, msg_id, body.get("model") or model, cfg)
+            return self._stream_messages(model, content, msg_id, body.get("model") or model, cfg, img_inputs)
 
         # Non-streaming Anthropic response
         try:
             def work(tok):
                 chat_id = create_chat(tok, model)
-                resp = open_completion_stream(tok, chat_id, model, content, parent_id=None, auto_search=cfg["autoSearch"])
+                resp = open_completion_stream(tok, chat_id, model, content, parent_id=None, auto_search=cfg["autoSearch"], files=_upload_files(tok, img_inputs))
                 state = {
                     "reasoning": "", "reasoningDelta": "", "contentDelta": "",
                     "content": "", "finished": False, "usage": None,
@@ -678,11 +736,11 @@ class handler(BaseHTTPRequestHandler):
             self._anthropic_error(502, "api_error", str(e))
 
     # ─── Anthropic streaming ───
-    def _stream_messages(self, model, content, msg_id, req_model, cfg):
+    def _stream_messages(self, model, content, msg_id, req_model, cfg, img_inputs=None):
         try:
             def work(tok):
                 chat_id = create_chat(tok, model)
-                resp = open_completion_stream(tok, chat_id, model, content, parent_id=None, auto_search=cfg["autoSearch"])
+                resp = open_completion_stream(tok, chat_id, model, content, parent_id=None, auto_search=cfg["autoSearch"], files=_upload_files(tok, img_inputs))
 
                 self.send_response(200)
                 self._cors()
