@@ -1,0 +1,22 @@
+# secrets & local env
+.env
+.env.local
+.env.*.local
+
+# python bytecode / caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# stray non-test artifacts
+lib/test
+net-capture-*.txt
+
+# editor / os cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
