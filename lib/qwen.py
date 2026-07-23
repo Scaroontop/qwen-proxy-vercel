@@ -591,20 +591,24 @@ _NARRATION_PREFIXES = (
     "i am analyzing", "i am evaluating", "i am working",
     "i am trying", "i am responding", "i am navigating",
     "i am proceeding", "i am attempting", "i am going to",
+    "i am focusing", "i am determining",
     "i consider", "i interpret", "i assess", "i analyze",
     "i will", "i should", "i need to", "i plan to",
     "trying to", "let me", "let's",
-    "my focus is", "my goal is", "my approach",
+    "my focus is", "my focus remains", "my goal is", "my approach",
+    "my response is", "while i cannot",
     "the path is", "the path appears", "the user", "this is a",
 )
 
 _EXCUSE_PATTERNS = (
-    r"can'?t\s+(reach|access|see)\b.*filesystem",
+    r"can'?t\s+(reach|access|see|view)\b.*filesystem",
     r"no\s+file\s+access",
-    r"no\s+\w+\s+access\s+tools?\s+(in\s+this\s+session|here)",
+    r"no\s+\w+\s+access\s+tools?\s+(in\s+this\s+session|here|available)",
     r"tool\s+\w+\s+(does\s+not\s+exist|doesn'?t\s+exist)",
     r"paste\s+the\s+contents?\s+of",
-    r"i\s+(don'?t|do\s+not|can'?t)\s+(have|see|access).*(tool|file|filesystem)",
+    r"i\s+(don'?t|do\s+not|can'?t|cannot)\s+(have|see|access|view|read).*(tool|file|filesystem|local)",
+    r"don'?t\s+have\s+(filesystem|file)\s+access",
+    r"no\s+(Read|Bash|file\s+tools?|actual\s+tool)",
     r"i'?m\s+(in|restricted\s+to)\s+a\s+(simulated|sandbox|limited|text)",
     r"no\s+actual\s+(tool|tools|file)",
     r"working\s+within\s+(the\s+user'?s|a\s+).*(environment|directory)",
@@ -612,6 +616,9 @@ _EXCUSE_PATTERNS = (
     r"technical\s+details\s+are\s+involved",
     r"no\s+external\s+tools",
     r"based\s+solely\s+on\s+the\s+(text\s+)?information\s+provided",
+    r"maintain\s+\w+\s+(clarity|coherence)",
+    r"prior\s+interaction\s+(involving|with)",
+    r"shaped\s+by\s+(the\s+need|my\s+)",
 )
 
 
@@ -814,7 +821,16 @@ _PROJECT_FILES = (
 _PROJECT_HINT_RE = re.compile(
     r"(?:view|see|read|show|look\s+at|fix|edit|examine|open|check|inspect|update|modify)\s+"
     r"(?:me\s+)?(?:the\s+)?(?:[\w-]+\s+){0,3}?"
+    r"[`'\(\[\"<]?"
+    r"(?:\.[\\/])?"
     r"(?P<path>[\w-]+(?:/[\w-]+)*\.\w{1,8})",
+    re.IGNORECASE,
+)
+
+# Standalone markdown-link form [alt](path.ext) that ZCode ships when
+# the user @-mentions a file. Catches bare links without an action verb.
+_MARKDOWN_LINK_RE = re.compile(
+    r"\[(?P<alt>[^\]]+?)\]\s*\(\s*(?:\.[\\/])?(?P<linkinner>[\w-]+(?:/[\w-]+)*\.\w{1,8})\s*\)",
     re.IGNORECASE,
 )
 
@@ -830,9 +846,20 @@ def maybe_inject_project_file(text: str) -> str | None:
     """
     if not text:
         return None
-    # Find a candidate path in the text
+    # First try the verb-prefixed form, then the standalone markdown-link
+    # form ZCode writes when the user @-mentions a file.
+    candidates = []
     for m in _PROJECT_HINT_RE.finditer(text):
-        candidate = m.group("path").lstrip("./").lower()
+        p = m.group("path")
+        if p:
+            candidates.append(p.strip().lstrip("./").lstrip(".\\").lower())
+    for m in _MARKDOWN_LINK_RE.finditer(text):
+        alt = m.group("alt") or ""
+        inner = m.group("linkinner") or ""
+        for cand in (inner, alt):
+            if cand:
+                candidates.append(cand.strip().lstrip("./").lstrip(".\\").lower())
+    for candidate in candidates:
         # Match either the full path or just the basename (e.g. "index.html"
         # resolves to "public/index.html").
         for f in _PROJECT_FILES:
