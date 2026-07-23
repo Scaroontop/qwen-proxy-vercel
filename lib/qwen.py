@@ -643,17 +643,21 @@ _NARRATION_PREFIXES = (
     "assessing", "considering", "interpreting", "analyzing",
     "evaluating", "examining", "reviewing", "determining",
     "attempting", "navigating", "proceeding", "responding to",
+    "i proceed", "i proceed with",
     "i am interpreting", "i am assessing", "i am considering",
     "i am analyzing", "i am evaluating", "i am working",
     "i am trying", "i am responding", "i am navigating",
     "i am proceeding", "i am attempting", "i am going to",
     "i am focusing", "i am determining",
+    "i am checking", "i am examining", "i am reviewing",
     "i consider", "i interpret", "i assess", "i analyze",
     "i will", "i should", "i need to", "i plan to",
     "trying to", "let me", "let's",
     "my focus is", "my focus remains", "my goal is", "my approach",
     "my response is", "while i cannot",
     "the path is", "the path appears",
+    "the analysis focuses", "particular attention is being paid",
+    "the analysis focuses on", "careful evaluation is being",
 )
 
 _EXCUSE_PATTERNS = (
