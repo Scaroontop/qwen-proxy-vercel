@@ -357,6 +357,7 @@ const chatEl = $('chat'), inputEl = $('input'), sendBtn = $('sendBtn');
 const history = [];
 let busy = false;
 let activeController = null;  // AbortController for the in-flight stream
+let pendingText = null;       // text queued to send once current stream dies
 let apiKey = localStorage.getItem('apiKey') || '';
 
 // ─── Stateless multi-turn state ───
@@ -591,12 +592,15 @@ function setSendBtnState() {
 }
 
 async function send() {
-  // If streaming, treat Send button as Stop
+  const text = inputEl.value.trim();
+  // If streaming, abort the current stream. If user typed new text, queue it
+  // to be sent immediately after the abort completes — no waiting allowed.
   if (busy) {
+    pendingText = text || null;
+    if (text) inputEl.value = '';
     if (activeController) activeController.abort();
     return;
   }
-  const text = inputEl.value.trim();
   if (!text) return;
   busy = true;
   setSendBtnState();
@@ -744,6 +748,9 @@ async function send() {
     setSendBtnState();
     scrollBottom();
     inputEl.focus();
+    const queued = pendingText;
+    pendingText = null;
+    if (queued) send();
   }
 }
 
