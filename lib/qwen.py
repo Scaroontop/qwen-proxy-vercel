@@ -287,11 +287,29 @@ _NARRATION_PREFIXES = (
     "attempting", "navigating", "proceeding", "responding to",
     "i am interpreting", "i am assessing", "i am considering",
     "i am analyzing", "i am evaluating", "i am working",
-    "i am trying", "i am responding", "i consider", "i interpret",
-    "i assess", "i analyze", "i will", "i should", "i need to",
-    "i am going to", "i plan to", "trying to", "let me", "let's",
+    "i am trying", "i am responding", "i am navigating",
+    "i am proceeding", "i am attempting", "i am going to",
+    "i consider", "i interpret", "i assess", "i analyze",
+    "i will", "i should", "i need to", "i plan to",
+    "trying to", "let me", "let's",
     "my focus is", "my goal is", "my approach",
-    "the path is", "the user", "this is a",
+    "the path is", "the path appears", "the user", "this is a",
+)
+
+_EXCUSE_PATTERNS = (
+    r"can'?t\s+(reach|access|see)\b.*filesystem",
+    r"no\s+file\s+access",
+    r"no\s+\w+\s+access\s+tools?\s+(in\s+this\s+session|here)",
+    r"tool\s+\w+\s+(does\s+not\s+exist|doesn'?t\s+exist)",
+    r"paste\s+the\s+contents?\s+of",
+    r"i\s+(don'?t|do\s+not|can'?t)\s+(have|see|access).*(tool|file|filesystem)",
+    r"i'?m\s+(in|restricted\s+to)\s+a\s+(simulated|sandbox|limited|text)",
+    r"no\s+actual\s+(tool|tools|file)",
+    r"working\s+within\s+(the\s+user'?s|a\s+).*(environment|directory)",
+    r"respecting\s+system\s+boundaries",
+    r"technical\s+details\s+are\s+involved",
+    r"no\s+external\s+tools",
+    r"based\s+solely\s+on\s+the\s+(text\s+)?information\s+provided",
 )
 
 
@@ -306,8 +324,13 @@ def strip_thinking_narration(text: str) -> str:
             kept.append(line)
             continue
         low = s.lower()
+        # Drop introspection-style narration lines (short, no code)
         if any(low.startswith(p) for p in _NARRATION_PREFIXES):
-            if len(s) < 120 and "`" not in s and "{" not in s and "def " not in s:
+            if len(s) < 160 and "`" not in s and "{" not in s and "def " not in s:
+                continue
+        # Drop tool-hallucination excuse lines anywhere in the text
+        if any(re.search(pat, s, re.IGNORECASE) for pat in _EXCUSE_PATTERNS):
+            if "`" not in s and "{" not in s:
                 continue
         kept.append(line)
     out = "\n".join(kept)
@@ -316,8 +339,6 @@ def strip_thinking_narration(text: str) -> str:
 
 
 _TC_KEY = '"tool_calls"'
-_TC_OPEN = '['
-_TC_CLOSE = ']'
 
 
 def _strip_raw_toolcalls_json(text: str) -> str:
@@ -468,6 +489,82 @@ def _flush_answer_buffer(state: dict) -> None:
     if cleaned:
         state["contentDelta"] = (state.get("contentDelta", "") or "") + cleaned
         state["content"] = (state.get("content", "") or "") + cleaned
+
+
+# ─── Read-only project file injection ──────────────────────────────
+# Allow the served AI to "view" files in the proxy project itself. The
+# server scans the last user message for a filename that matches a known
+# project file and, if found, appends the file contents into the prompt
+# so qwen can answer about it. Read-only: no path escapes the project root.
+
+# Allowlist of files the served AI is allowed to "see". Path-safe keys only.
+_PROJECT_FILES = (
+    "lib/qwen.py",
+    "api/index.py",
+    "public/index.html",
+    "requirements.txt",
+    "vercel.json",
+    "README.md",
+    ".env.example",
+)
+
+_PROJECT_HINT_RE = re.compile(
+    r"(?:view|see|read|show|look\s+at|fix|edit|examine|open|check|inspect|update|modify)\s+"
+    r"(?:me\s+)?(?:the\s+)?(?:[\w-]+\s+){0,3}?"
+    r"(?P<path>[\w-]+(?:/[\w-]+)*\.\w{1,8})",
+    re.IGNORECASE,
+)
+
+
+def maybe_inject_project_file(text: str) -> str | None:
+    """If the user's latest message asks to view / fix / etc a known project
+    file, return the file content prefixed with a "you are reading this file"
+    note. Otherwise return None.
+
+    The returned string is meant to be appended to the user message content,
+    so qwen sees the file inline and can answer questions about it directly.
+    The user keeps their original text — we just tack the file on the end.
+    """
+    if not text:
+        return None
+    # Find a candidate path in the text
+    for m in _PROJECT_HINT_RE.finditer(text):
+        candidate = m.group("path").lstrip("./").lower()
+        # Match either the full path or just the basename (e.g. "index.html"
+        # resolves to "public/index.html").
+        for f in _PROJECT_FILES:
+            if f.lower() == candidate or f.lower().endswith("/" + candidate):
+                # Read the file — allowed regardless of Vercel cwd since the
+                # repository is mounted at the function's working directory.
+                rel = f
+                tried = [
+                    rel,
+                    os.path.join("/var/task", rel),  # Vercel serverless root
+                    os.path.join(os.getcwd(), rel),
+                ]
+                for path in tried:
+                    try:
+                        with open(path, "r", encoding="utf-8") as fh:
+                            data = fh.read()
+                    except (OSError, UnicodeDecodeError):
+                        continue
+                    if data:
+                        return (
+                            "\n\n--- SYSTEM NOTE: you have access to the "
+                            f"contents of `{f}` below. Use it to answer the "
+                            "user's request about this file. ---\n\n"
+                            f"```{f.rsplit('.', 1)[-1] if '.' in f else ''}\n"
+                            f"{data}\n```\n"
+                            "--- END FILE ---"
+                        )
+                # File matched but couldn't be read — acknowledge transparently
+                return (
+                    f"\n\n--- SYSTEM NOTE: file `{f}` is in the project allowlist "
+                    "but could not be read from the server runtime. Tell the "
+                    "user the file exists but the server cannot expose its "
+                    "contents in this environment. ---"
+                )
+    return None
 
 
 # ─── Message collapsing (same logic) ──────────────────────────────
@@ -680,6 +777,17 @@ def run_with_failover(fn: Callable):
 
 def resolve_model(requested: str | None) -> str:
     cfg = get_config()
-    if requested and re.match(r"^qwen", requested, re.I):
-        return requested
+    if not requested:
+        return cfg["defaultModel"]
+    r = requested.strip().lower()
+    known = {
+        "qwen3.8-max-preview",
+        "qwen3-235b-a22b",
+        "qwen3-32b",
+        "qwen3-14b",
+        "qwen3-8b",
+        "qwen3-next-80b-a3b",
+    }
+    if r in known:
+        return r
     return cfg["defaultModel"]
