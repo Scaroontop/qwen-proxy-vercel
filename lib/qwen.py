@@ -653,7 +653,7 @@ _NARRATION_PREFIXES = (
     "trying to", "let me", "let's",
     "my focus is", "my focus remains", "my goal is", "my approach",
     "my response is", "while i cannot",
-    "the path is", "the path appears", "the user", "this is a",
+    "the path is", "the path appears",
 )
 
 _EXCUSE_PATTERNS = (
