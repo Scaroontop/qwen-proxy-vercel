@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import (HTTPRedirectHandler, Request, build_opener, urlopen)
 
 BASE = "https://chat.qwen.ai"
 
@@ -238,9 +238,11 @@ def open_completion_stream(tok: dict[str, Any], chat_id: str, model: str, conten
 #      with the same headers ali-oss sends and OSS accepts.
 
 import base64
-import hashlib
-import hmac
+import ipaddress
+import socket
 import urllib.parse as up
+
+# Local imports here (consolidated with the top-level urllib.request import).
 
 # Standard MIME -> qwen filetype buckets the web app uses
 _MIME_TO_FILETYPE = {
@@ -425,15 +427,125 @@ upload_image_to_oss = upload_file_to_oss
 _DATA_URI_RE = re.compile(r"^data:([\w/+-]+);base64,(.*)$", re.DOTALL)
 
 
+class _NoRedirect(HTTPRedirectHandler):
+    """Raise instead of auto-following redirects so we can revalidate hops."""
+    def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+        raise HTTPError(newurl, code, msg, hdrs, fp)
+
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirect)
+
+
+def _is_disallowed_host(host: str) -> bool:
+    """True if a resolved hostname points at a non-public address.
+
+    Used to block SSRF targets: loopback, RFC1918 / ULA, link-local,
+    multicast, the cloud-metadata ranges (169.254.169.254 et al),
+    unspecified (`0.0.0.0`), and reserved blocks. We resolve every A/AAAA
+    record and reject if ANY of them is non-public — a benign hostname that
+    resolves to a private IP (e.g. via attacker DNS) must still be blocked.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return True  # unresolvable → treat as disallowed (no point proxying it)
+    for family, _, _, _, sockaddr in infos:
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return True
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+                or ip.is_multicast):
+            return True
+        # Explicitly block the cloud-metadata / link-local well-known ranges
+        # even though is_link_local usually catches them (defense in depth).
+        if str(ip).startswith("169.254.") or str(ip) == "100.100.100.200":
+            return True
+    return False
+
+
 def _fetch_url(url: str, max_bytes: int = 8 * 1024 * 1024) -> tuple[bytes, str]:
-    """Fetch a public URL and return (bytes, content-type). Rejects > 8MB."""
-    req = Request(url, headers={"User-Agent": UA}, method="GET")
-    r = urlopen(req, timeout=20)
-    ct = (r.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
-    data = r.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise UpstreamError("file_too_big", "image exceeds 8MB")
-    return data, ct
+    """Fetch a *public* HTTP(S) URL and return (bytes, content-type).
+
+    Hardening vs. the original ``urlopen(url)``-ver throwaway:
+
+    * Scheme allowlist — only ``http``/``https``. ``file:`` and the rest of
+      urllib's handlers are rejected so a caller can't ask the proxy to read
+      ``file:///etc/passwd`` and feed it to the model.
+
+    * Host resolution guard — the resolved A/AAAA records are checked against
+      a private/loopback/link-local/metadata allowlist BEFORE the connection
+      is opened, so redirects to internal IPs and attacker DNS rebinding
+      can't pivot into the Vercel network.
+
+    * Size cap — reads at most ``max_bytes``; oversize attachments raise a
+      structured UpstreamError instead of blindly buffering.
+
+    * Redirect revalidation — follow at most 5 redirects and re-apply the
+      scheme + host checks on every hop, since the destination host can
+      differ from the original.
+    """
+    parsed = up.urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise UpstreamError("bad_scheme", f"scheme not allowed: {parsed.scheme}")
+    if not parsed.hostname:
+        raise UpstreamError("bad_url", "missing host")
+    current = url
+    for _ in range(5):
+        parsed = up.urlparse(current)
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise UpstreamError("bad_scheme", f"redirect to non-allowed scheme: {parsed.scheme}")
+        if _is_disallowed_host(parsed.hostname):
+            raise UpstreamError("ssrf_blocked", f"hostname resolves to non-public address: {parsed.hostname}")
+        req = Request(current, headers={"User-Agent": UA}, method="GET")
+        try:
+            r = _NO_REDIRECT_OPENER.open(req, timeout=20)
+        except HTTPError as e:
+            if 300 <= e.code < 400:
+                loc = e.headers.get("Location")
+                if not loc:
+                    raise UpstreamError("bad_redirect", f"redirect {e.code} without Location") from e
+                current = up.urljoin(current, loc)
+                continue
+            raise UpstreamError(f"http_{e.code}", str(e.reason)) from e
+        except URLError as e:
+            raise UpstreamError("network", str(e.reason)) from e
+        ct = (r.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
+        data = r.read(max_bytes + 1)
+        r.close()
+        if len(data) > max_bytes:
+            raise UpstreamError("file_too_big", f"fetched resource exceeds {max_bytes} bytes")
+        return data, ct
+    raise UpstreamError("too_many_redirects", "more than 5 redirects")
+
+
+_MAX_ATTACHMENTS = 20
+_MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024   # per file (decoded)
+_MAX_AGGREGATE_BYTES = 25 * 1024 * 1024   # all files combined
+_MAX_FILENAME_LEN = 256
+
+
+def _decode_b64_strict(s: str) -> bytes:
+    """Strict base64 decode. Rejects malformed input outright — the looser
+    default silently converts ``%%`` into an empty payload and lets malformed
+    uploads through. Raises :class:`UpstreamError` with kind ``bad_base64``."""
+    try:
+        return base64.b64decode(s, validate=True)
+    except Exception as e:  # binascii.Error subclass
+        raise UpstreamError("bad_base64", str(e)) from e
+
+
+def _enforce_attachment(data: bytes, total: int) -> None:
+    """Per-file + aggregate size enforcer. Raises UpstreamError early so we
+    don't spend OSS upload quota on payloads that will be rejected downstream."""
+    if len(data) > _MAX_ATTACHMENT_BYTES:
+        raise UpstreamError("file_too_big",
+                            f"attachment exceeds {_MAX_ATTACHMENT_BYTES} bytes")
+    if total + len(data) > _MAX_AGGREGATE_BYTES:
+        raise UpstreamError("file_too_big",
+                            f"total attachments exceed {_MAX_AGGREGATE_BYTES} bytes")
 
 
 def extract_image_inputs(messages: list[dict]) -> tuple[list[dict], list[tuple[bytes, str, str]]]:
@@ -450,10 +562,20 @@ def extract_image_inputs(messages: list[dict]) -> tuple[list[dict], list[tuple[b
       - {"type":"file", "filename":"foo.html", "file_data":"<data-uri>"}
       - {"type":"input_file", "filename":"foo.txt",
          "file_data":{"data":"<base64>", "content_type":"text/plain"}}
+
+    Enforced caps (raise :class:`UpstreamError`):
+      - up to 20 attachments per request
+      - 8 MiB per decoded attachment
+      - 25 MiB total decoded bytes across all attachments
+      - 256-char filename length
+      - strict base64 decoding (no silent tolerance of malformed input)
     """
     img_inputs = []
     text_messages = []
+    total_bytes = 0
     for msg in messages:
+        if not isinstance(msg, dict):
+            continue
         role = msg.get("role")
         content = msg.get("content")
         if isinstance(content, str):
@@ -472,6 +594,9 @@ def extract_image_inputs(messages: list[dict]) -> tuple[list[dict], list[tuple[b
             if bt == "text":
                 text_parts.append(block.get("text", ""))
             elif bt == "image_url":
+                if len(img_inputs) >= _MAX_ATTACHMENTS:
+                    raise UpstreamError("too_many_files",
+                                        f"more than {_MAX_ATTACHMENTS} attachments")
                 url = (block.get("image_url") or {}).get("url") if isinstance(block.get("image_url"), dict) else block.get("image_url")
                 if not url:
                     continue
@@ -479,10 +604,7 @@ def extract_image_inputs(messages: list[dict]) -> tuple[list[dict], list[tuple[b
                 m = _DATA_URI_RE.match(url)
                 if m:
                     ct = m.group(1)
-                    try:
-                        data = base64.b64decode(m.group(2))
-                    except Exception as e:
-                        raise UpstreamError("bad_base64", str(e))
+                    data = _decode_b64_strict(m.group(2))
                     ext = ct.split("/")[-1].split("+")[0]
                     fn = f"image.{ext}"
                 else:
@@ -493,9 +615,16 @@ def extract_image_inputs(messages: list[dict]) -> tuple[list[dict], list[tuple[b
                     except Exception as e:
                         raise UpstreamError("fetch_img", str(e))
                     fn = (url.split("/")[-1].split("?")[0]) or f"image.{ct.split('/')[-1]}"
+                _enforce_attachment(data, total_bytes)
+                total_bytes += len(data)
                 img_inputs.append((data, fn, ct))
             elif bt in ("input_file", "file"):
+                if len(img_inputs) >= _MAX_ATTACHMENTS:
+                    raise UpstreamError("too_many_files",
+                                        f"more than {_MAX_ATTACHMENTS} attachments")
                 fn = block.get("filename") or block.get("name") or "upload.txt"
+                if len(fn) > _MAX_FILENAME_LEN:
+                    raise UpstreamError("bad_input_file", "filename too long")
                 fd = block.get("file_data")
                 if isinstance(fd, dict):
                     b64 = fd.get("data") or fd.get("contents")
@@ -509,17 +638,13 @@ def extract_image_inputs(messages: list[dict]) -> tuple[list[dict], list[tuple[b
                 m = _DATA_URI_RE.match(b64)
                 if m:
                     ct_val = m.group(1)
-                    try:
-                        data = base64.b64decode(m.group(2))
-                    except Exception as e:
-                        raise UpstreamError("bad_base64", str(e))
+                    data = _decode_b64_strict(m.group(2))
                 elif ct_val:
-                    try:
-                        data = base64.b64decode(b64)
-                    except Exception as e:
-                        raise UpstreamError("bad_base64", str(e))
+                    data = _decode_b64_strict(b64)
                 else:
                     raise UpstreamError("bad_input_file", "input_file needs base64 data URI or content_type")
+                _enforce_attachment(data, total_bytes)
+                total_bytes += len(data)
                 img_inputs.append((data, fn, ct_val or "text/plain"))
                 # If the attached file is text-like (.html/.txt/.py/.json/etc.),
                 # also inline its decoded contents into the user message. qwen's
@@ -553,19 +678,60 @@ def extract_image_inputs(messages: list[dict]) -> tuple[list[dict], list[tuple[b
 
 
 def consume_sse(resp, on_event: Callable[[dict], None]) -> None:
+    """Read an SSE stream from `resp`, dispatching one parsed JSON event at a time.
+
+    Three correctness invariants vs. the naive reader it replaced:
+
+      1. UTF-8 is decoded with a *stateful* incremental decoder so multibyte
+         characters split across read boundaries don't turn into U+FFFD and
+         corrupt the JSON payload (which the old per-chunk
+         `decode(errors="replace")` did).
+
+      2. Event framing tolerates both LF and CRLF blank-line delimiters. The
+         old splitter only looked for `\\n\\n`, so a strict-CRLF upstream held
+         the entire body buffered until EOF and broke live streaming.
+
+      3. `UpstreamError` (raised by extract_delta for in-stream error frames)
+         and other real exceptions propagate. The old `except Exception: pass`
+         around on_event swallowed upstream errors, so streaming clients saw
+         empty replies and failover never advanced tokens.
+
+    Lines within one event are joined per SSE spec (multiple `data:` lines
+    concatenate), though Qwen emits one `data:` per frame so this is mostly
+    defensive.
+    """
+    import codecs
+    dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
     buf = ""
     try:
         while True:
             chunk = resp.read(4096)
             if not chunk:
-                if buf.strip():
-                    for block in buf.split("\n\n"):
-                        _dispatch_sse_block(block, on_event)
                 break
-            buf += chunk.decode("utf-8", errors="replace")
+            buf += dec.decode(chunk)
+            # Normalize CRLF/CR line endings to LF before event framing so
+            # both `\n\n` and `\r\n\r\n` delimiters collapse uniformly.
+            if "\r" in buf:
+                buf = buf.replace("\r\n", "\n").replace("\r", "\n")
             while "\n\n" in buf:
                 block, buf = buf.split("\n\n", 1)
-                _dispatch_sse_block(block, on_event)
+                dispatch_sse_block(block, on_event)
+        # Drain incremental decoder's tail (final multibyte char).
+        tail = dec.decode(b"", final=True)
+        if tail:
+            buf += tail
+        if "\r" in buf:
+            buf = buf.replace("\r\n", "\n").replace("\r", "\n")
+        # Flush any trailing event the stream closed without a blank-line
+        # delimiter for — happens when the upstream clips the last chunk.
+        if buf.strip():
+            dispatch_sse_block(buf, on_event)
+        else:
+            # Even a final frame with no trailing newline must be parsed if it
+            # carries a data: line. Re-check non-blank content.
+            for block in buf.split("\n\n"):
+                if block.strip():
+                    dispatch_sse_block(block, on_event)
     finally:
         try:
             resp.close()
@@ -573,17 +739,40 @@ def consume_sse(resp, on_event: Callable[[dict], None]) -> None:
             pass
 
 
-def _dispatch_sse_block(block: str, on_event: Callable[[dict], None]) -> None:
+_DISPATCH_MAX_EVENTS = 256
+
+
+def dispatch_sse_block(block: str, on_event: Callable[[dict], None]) -> None:
+    """Parse one SSE event block and invoke `on_event` once per JSON data frame.
+
+    Catches only `json.JSONDecodeError` — malformed payloads from a flaky
+    upstream shouldn't take down the whole stream but also shouldn't hide
+    callback-raised exceptions (which include `UpstreamError`).
+    """
+    data_lines = []
     for line in block.split("\n"):
         if not line.startswith("data:"):
-            continue
-        payload = line[5:].strip()
+            # SSE also allows "data:value" without the space; normalize.
+            if line.startswith("data"):
+                line = ":" + line[4:]
+            else:
+                continue
+        payload = line[5:].lstrip()
         if not payload or payload == "[DONE]":
             continue
+        data_lines.append(payload)
+    if not data_lines:
+        return
+    # SSE joins multiple `data:` lines with a newline to form one event.
+    # Qwen emits a single JSON object per frame, so this loop is mostly a
+    # safety belt against a weird upstream splitting one object across lines.
+    for raw in data_lines:
         try:
-            on_event(json.loads(payload))
-        except Exception:
-            pass
+            evt = json.loads(raw)
+        except json.JSONDecodeError:
+            # Ignore malformed bytes; the next frame is independent.
+            continue
+        on_event(evt)
 
 
 # ─── SSE frame parsing ─────────────────────────────────────────────
@@ -704,7 +893,10 @@ def strip_thinking_narration(text: str) -> str:
         kept.append(line)
     out = "\n".join(kept)
     out = re.sub(r"\n{3,}", "\n\n", out)
-    return out.strip()
+    # Preserve trailing newline — caller streams lines as they arrive and
+    # relies on the newline to keep adjacent lines from fusing. Final
+    # whitespace-only trims are the caller's responsibility.
+    return out
 
 
 _TC_KEY = '"tool_calls"'
@@ -810,6 +1002,13 @@ def extract_delta(frame: dict, state: dict) -> None:
 def _emit_answer_chunk(raw: str, state: dict) -> None:
     """Buffer answer content by line, strip narration leaks, emit clean lines.
 
+    Only writes the delta to ``state["contentDelta"]`` — accumulation of the
+    full transcript into ``state["content"]`` is the *handler's* job (see the
+    non-streaming and streaming on_event callbacks in api/index.py). Keeping a
+    single owner for ``content`` is what prevents the double-append bug the
+    naive implementation shipped with (lib appended + handler appended =
+    every answer spat out twice in non-streaming mode).
+
     Qwen sometimes leaks its thinking-phase narration ("Assessing the request...",
     "I am interpreting...") into the answer phase. We hold content until we see a
     newline, then run strip_thinking_narration on the completed line. Partial
@@ -838,7 +1037,6 @@ def _emit_answer_chunk(raw: str, state: dict) -> None:
             cleaned = _strip_raw_toolcalls_json(cleaned)
         if cleaned:
             state["contentDelta"] = (state.get("contentDelta", "") or "") + cleaned
-            state["content"] = (state.get("content", "") or "") + cleaned
     else:
         # No newline yet. Keep buffering up to a small cap so we can still
         # strip narration leaks; beyond that, flush live to avoid making
@@ -852,11 +1050,13 @@ def _emit_answer_chunk(raw: str, state: dict) -> None:
                 flushed = _strip_raw_toolcalls_json(flushed)
             if flushed:
                 state["contentDelta"] = (state.get("contentDelta", "") or "") + flushed
-                state["content"] = (state.get("content", "") or "") + flushed
 
 
 def _flush_answer_buffer(state: dict) -> None:
-    """Emit any leftover buffered content at end of stream."""
+    """Emit any leftover buffered content at end of stream into contentDelta.
+
+    Only writes the delta — handlers consume it (and update ``content``).
+    """
     buf = state.get("answerBuf", "")
     if not buf:
         return
@@ -866,7 +1066,6 @@ def _flush_answer_buffer(state: dict) -> None:
         cleaned = _strip_raw_toolcalls_json(cleaned)
     if cleaned:
         state["contentDelta"] = (state.get("contentDelta", "") or "") + cleaned
-        state["content"] = (state.get("content", "") or "") + cleaned
 
 
 # ─── Read-only project file injection ──────────────────────────────
@@ -876,14 +1075,14 @@ def _flush_answer_buffer(state: dict) -> None:
 # so qwen can answer about it. Read-only: no path escapes the project root.
 
 # Allowlist of files the served AI is allowed to "see". Path-safe keys only.
+# Keep this aligned with what actually exists on disk — otherwise file-injection
+# falsely matches a known alias, fails to read, and reports "couldn't open"
+# instead of doing nothing.
 _PROJECT_FILES = (
     "lib/qwen.py",
     "api/index.py",
     "public/index.html",
-    "requirements.txt",
     "vercel.json",
-    "README.md",
-    ".env.example",
 )
 
 _PROJECT_HINT_RE = re.compile(
@@ -1134,12 +1333,20 @@ def try_parse_tool_calls(text: str | None, tools: list) -> list | None:
         else:
             continue
         for item in arr:
-            name = item.get("name") or (item.get("function") or {}).get("name")
-            if not name or (known and name not in known):
+            if not isinstance(item, dict):
                 continue
-            args = item.get("arguments")
-            if args is None and item.get("function"):
-                args = item["function"].get("arguments")
+            fn = item.get("function")
+            name = item.get("name")
+            if not name and isinstance(fn, dict):
+                name = fn.get("name")
+            if not name:
+                continue
+            if known and name not in known:
+                continue
+            if isinstance(fn, dict):
+                args = fn.get("arguments")
+            else:
+                args = item.get("arguments")
             if args is None:
                 args = {}
             if not isinstance(args, str):
@@ -1177,8 +1384,15 @@ def run_with_failover(fn: Callable):
 
 
 def resolve_model(requested: str | None) -> str:
+    """Return the upstream model id for a caller-supplied model string.
+
+    Empty / None → the configured default (the "use default" path). A
+    non-empty unknown id → :class:`UpstreamError` with kind ``bad_model`` so
+    handlers can map it to a 400 instead of silently substituting the default
+    and mislabeling the response with the caller's model name.
+    """
     cfg = get_config()
-    if not requested:
+    if not requested or not requested.strip():
         return cfg["defaultModel"]
     r = requested.strip().lower()
     known = {
@@ -1191,4 +1405,4 @@ def resolve_model(requested: str | None) -> str:
     }
     if r in known:
         return r
-    return cfg["defaultModel"]
+    raise UpstreamError("bad_model", requested)
